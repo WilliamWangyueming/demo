@@ -34,7 +34,7 @@ def select_transmission_mode():
         elif choice == '2':
             return select_wireless_speed()
         elif choice == '3':
-            return 'hybrid', 400000
+            return 'hybrid', 2000000  # 视频传输使用2MHz，握手信号使用400K
         else:
             print("❌ Invalid choice, please enter 1, 2, or 3")
 
@@ -86,10 +86,21 @@ SENDER_PORT = 'COM7'        # Sender port (modify according to actual situation)
 WIRELESS_HOST = '127.0.0.1'  # Server IP (localhost for same computer testing)
 WIRELESS_PORT = 8888         # Wireless port
 
+# Connection role
+WIRELESS_ROLE = 'server'     # 发送端作为服务器端
+
+# TCP Socket optimizations
+TCP_NODELAY = True           # 禁用Nagle算法，减少延迟
+TCP_BUFFER_SIZE = 262144     # 设置更大的发送缓冲区 (256KB)
+SOCKET_TIMEOUT = 0.5         # Socket超时设置
+
 # Camera configuration
 CAMERA_INDEX = 0            # Camera index (usually 0)
 FRAME_WIDTH = 320           # Frame width
 FRAME_HEIGHT = 240          # Frame height
+WIRELESS_FRAME_WIDTH = 640  # 无线模式帧宽度
+WIRELESS_FRAME_HEIGHT = 480 # 无线模式帧高度
+USE_COLOR_FOR_WIRELESS = True  # 无线模式使用彩色图像
 
 # Performance mode configuration (options: high_fps, balanced, high_quality, ultra_fast)
 PERFORMANCE_MODE = "balanced"
@@ -111,9 +122,23 @@ class WirelessUARTController:
         self.last_send_time = time.time()
         self.bytes_sent_this_second = 0
         
+        # 1MHz模式特殊优化
+        self.is_1mhz_mode = (baud_rate == 1000000)
+        
+        # 高速模式 (>1MHz)
+        self.is_high_speed = (baud_rate >= 1000000)
+        
         # Use more relaxed limits for high speeds
-        if baud_rate > 500000:
-            self.burst_allowance = 1.5  # Allow 150% burst transmission
+        if self.is_1mhz_mode:
+            # 1MHz模式专用优化设置
+            self.burst_allowance = 2.0   # 允许200%突发传输
+            self.adaptive_window = 0.25  # 250ms窗口
+        elif self.is_high_speed:
+            # 高速模式 (>=1MHz)
+            self.burst_allowance = 3.0   # 允许300%突发传输
+            self.adaptive_window = 0.1   # 100ms窗口
+        elif baud_rate > 500000:
+            self.burst_allowance = 1.5   # Allow 150% burst transmission
             self.adaptive_window = 0.5   # 500ms window
         else:
             self.burst_allowance = 1.0   # Strict limit
@@ -121,8 +146,39 @@ class WirelessUARTController:
         
     def calculate_delay(self, data_size):
         """Calculate transmission delay to control UART rate"""
+        # 高速模式 (>=1MHz) - 几乎不限制传输速率
+        if self.is_high_speed and self.baud_rate >= 2000000:
+            # 对于2MHz以上的速率，基本不限制传输速率
+            return 0
+            
         current_time = time.time()
         
+        # 1MHz模式专用算法
+        if self.is_1mhz_mode:
+            # 1MHz优化: 更短的时间窗口，更宽松的突发限制
+            time_window = self.adaptive_window
+            burst_multiplier = self.burst_allowance
+            
+            # Reset counter if time window exceeded
+            if current_time - self.last_send_time >= time_window:
+                self.last_send_time = current_time
+                self.bytes_sent_this_second = 0
+            
+            # Calculate allowed bytes in window - 利用更高比例的理论带宽
+            allowed_bytes = (self.bytes_per_second * time_window * burst_multiplier)
+            remaining_bytes = allowed_bytes - self.bytes_sent_this_second
+            
+            if data_size <= remaining_bytes:
+                # Can send immediately
+                self.bytes_sent_this_second += data_size
+                return 0
+            else:
+                # 计算最小等待时间
+                excess_bytes = data_size - remaining_bytes
+                min_wait = excess_bytes / (self.bytes_per_second * 2.5)  # 只等待最小时间
+                return min(min_wait, 0.002)  # 最多等待2ms
+        
+        # 原有逻辑（非1MHz模式）
         # Ultra-high speed mode: Significantly reduce restrictions
         if self.baud_rate >= 1000000:
             # 1MHz and above: Very relaxed limits, focus on maintaining average rate rather than strict limiting
@@ -188,7 +244,7 @@ class WebPSender:
         self.handshake_thread = None
         self.handshake_running = False
         self.handshake_counter = 0
-        self.handshake_interval = 0.05  # 设置为50ms，提供适中的频率
+        self.handshake_interval = 0.03  # 设置为30ms，提供更高的频率
         self.handshake_buffer = bytearray()  # 用于存储预生成的握手包
         
         # Camera
@@ -200,6 +256,9 @@ class WebPSender:
         # Performance mode configuration
         self.performance_mode = performance_mode
         self.setup_performance_mode()
+        
+        # 1MHz优化标志
+        self.optimized_for_1mhz = False
         
         # Error recovery
         self.last_successful_time = time.time()
@@ -262,34 +321,83 @@ class WebPSender:
         self.mode_description = config["description"]
         
         # 🚀 Wireless mode performance optimization
-        if self.transmission_mode == 'wireless':
+        if self.transmission_mode == 'wireless' or self.transmission_mode == 'hybrid':
             # Adjust performance parameters based on wireless speed
             speed_multiplier = self.baud_rate / 300000  # Multiplier relative to UART baseline speed
             
-            if speed_multiplier > 1.0:
-                # Smart frame rate adjustment: Not overly aggressive, ensure stability
-                if speed_multiplier >= 3.0:  # 1MHz and above
-                    # High-speed wireless: Moderate improvement, avoid over-optimization
-                    target_fps = min(30, 15 * min(speed_multiplier / 2, 2.0))
-                    self.current_fps_delay = max(0.02, 1.0 / target_fps)
-                else:
-                    # Medium-speed wireless: Conservative improvement
-                    self.current_fps_delay = max(0.03, self.current_fps_delay / speed_multiplier)
+            # 1MHz specific optimizations
+            if self.baud_rate == 1000000:
+                self.optimized_for_1mhz = True
+                # 1MHz专用优化配置 - 基于帧率计算
+                # 目标: 320×240 @ 24 fps, bpp≈0.30 (-q 45~50), 码率 ≈ 645 kbps
+                # 有效带宽利用率约为70-80%，所以1MHz理论上可以支持约800kbps的数据传输
+                self.current_quality = 45  # 设定为计算中的q值
+                self.webp_method = 3  # 降低压缩级别，加快编码速度
+                self.current_fps_delay = 0.025  # 约40fps
+                self.target_packet_size = int(self.target_packet_size * 1.2)  # 允许更大的包大小
                 
-                # Improve quality and packet size limits
-                self.current_quality = min(85, int(self.current_quality * min(speed_multiplier, 1.5)))
-                self.target_packet_size = int(self.target_packet_size * min(speed_multiplier, 2.0))
+                # 在标题中标记为优化模式
+                self.mode_description = f"1MHz Optimized (target: 24-30fps, Q45)"
                 
-                # Update description
+                print(f"🔥 1MHz OPTIMIZED MODE ENABLED")
+                print(f"   Target quality: Q{self.current_quality}")
+                print(f"   Target FPS: 24-30")
+                print(f"   WebP method: {self.webp_method}")
+                print(f"   Packet size limit: {self.target_packet_size}B")
+            # 高速模式 (>=2MHz)
+            elif self.baud_rate >= 2000000:
+                self.is_high_speed = True
+                # 高速模式 - 针对2MHz及以上
+                target_fps = min(60, int(self.baud_rate / 1000000 * 30))  # 2MHz=60fps, 5MHz=60fps
+                self.current_fps_delay = max(0.01, 1.0 / target_fps)  # 最小10ms延迟，最高100fps
+                
+                # 质量设置
+                if self.baud_rate >= 5000000:  # 5MHz
+                    self.current_quality = 75  # 更高质量
+                    self.webp_method = 4      # 平衡压缩质量和速度
+                else:  # 2MHz
+                    self.current_quality = 60
+                    self.webp_method = 3
+                
+                # 允许更大的包大小
+                self.target_packet_size = int(self.target_packet_size * (self.baud_rate / 1000000))
+                
+                # 模式描述
                 improved_fps = 1.0 / self.current_fps_delay
-                self.mode_description = f"{config['description']} → Wireless optimized ({improved_fps:.0f}fps, Q{self.current_quality})"
+                self.mode_description = f"High Speed {self.baud_rate/1000000:.0f}MHz Mode ({improved_fps:.0f}fps, Q{self.current_quality})"
                 
-                print(f"🌐 Wireless mode performance enhancement:")
-                print(f"   Speed multiplier: {speed_multiplier:.1f}x")
-                print(f"   FPS optimization: {1.0/config['fps_delay']:.0f} → {improved_fps:.0f} fps")
-                print(f"   Quality optimization: Q{config['quality']} → Q{self.current_quality}")
-                print(f"   Packet size limit: {config['target_packet_size']} → {self.target_packet_size}B")
-                print(f"   Delay setting: {self.current_fps_delay*1000:.1f}ms")
+                print(f"⚡ HIGH SPEED MODE ({self.baud_rate/1000000:.1f}MHz):")
+                print(f"   Target FPS: {improved_fps:.0f}")
+                print(f"   Quality: Q{self.current_quality}")
+                print(f"   WebP method: {self.webp_method}")
+                print(f"   Packet size limit: {self.target_packet_size}B")
+                print(f"   Delay: {self.current_fps_delay*1000:.1f}ms")
+            else:
+                # 其他速率使用原有计算逻辑
+                if speed_multiplier > 1.0:
+                    # Smart frame rate adjustment: Not overly aggressive, ensure stability
+                    if speed_multiplier >= 3.0:  # 1MHz and above
+                        # High-speed wireless: Moderate improvement, avoid over-optimization
+                        target_fps = min(30, 15 * min(speed_multiplier / 2, 2.0))
+                        self.current_fps_delay = max(0.02, 1.0 / target_fps)
+                    else:
+                        # Medium-speed wireless: Conservative improvement
+                        self.current_fps_delay = max(0.03, self.current_fps_delay / speed_multiplier)
+                    
+                    # Improve quality and packet size limits
+                    self.current_quality = min(85, int(self.current_quality * min(speed_multiplier, 1.5)))
+                    self.target_packet_size = int(self.target_packet_size * min(speed_multiplier, 2.0))
+                    
+                    # Update description
+                    improved_fps = 1.0 / self.current_fps_delay
+                    self.mode_description = f"{config['description']} → Wireless optimized ({improved_fps:.0f}fps, Q{self.current_quality})"
+                    
+                    print(f"🌐 Wireless mode performance enhancement:")
+                    print(f"   Speed multiplier: {speed_multiplier:.1f}x")
+                    print(f"   FPS optimization: {1.0/config['fps_delay']:.0f} → {improved_fps:.0f} fps")
+                    print(f"   Quality optimization: Q{config['quality']} → Q{self.current_quality}")
+                    print(f"   Packet size limit: {config['target_packet_size']} → {self.target_packet_size}B")
+                    print(f"   Delay setting: {self.current_fps_delay*1000:.1f}ms")
         
         print(f"🎯 Performance mode: {self.mode_description}")
         print(f"   Quality: Q{self.current_quality}")
@@ -306,39 +414,67 @@ class WebPSender:
         print("🚀 Initializing WebP video sender...")
         print("📊 Sender features:")
         print("- Performance configuration based on actual test data")
-        print("- Grayscale images reduce data by 67%")
+        
+        # 根据传输模式决定是否使用彩色图像
+        is_wireless_mode = self.transmission_mode in ['wireless', 'hybrid']
+        use_color = is_wireless_mode and USE_COLOR_FOR_WIRELESS
+        use_high_res = is_wireless_mode
+        
+        if use_color:
+            print("- Color images for better visual quality")
+        else:
+            print("- Grayscale images reduce data by 67%")
+        
         print("- WebP compression ratio up to 104x")
         print("- Smart dynamic quality adjustment")
         print(f"- Supports {self.transmission_mode.upper()} transmission mode")
         
-        # Initialize camera
+        # 初始化摄像头
         self.cap = cv2.VideoCapture(CAMERA_INDEX)
         if not self.cap.isOpened():
             print("❌ Camera initialization failed")
             return False
         
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        # 根据传输模式设置分辨率
+        if use_high_res:
+            width = WIRELESS_FRAME_WIDTH
+            height = WIRELESS_FRAME_HEIGHT
+            print(f"- Higher resolution for wireless mode: {width}x{height}")
+        else:
+            width = FRAME_WIDTH
+            height = FRAME_HEIGHT
+        
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
-        print(f"✅ Camera initialization successful ({FRAME_WIDTH}x{FRAME_HEIGHT} grayscale)")
+        
+        # 存储配置
+        self.use_color = use_color
+        self.frame_width = width
+        self.frame_height = height
+        
+        if use_color:
+            print(f"✅ Camera initialization successful ({width}x{height} color)")
+        else:
+            print(f"✅ Camera initialization successful ({width}x{height} grayscale)")
         
         # Initialize communication according to transmission mode
         if self.transmission_mode == 'uart':
-            return self.init_uart()
+            return self.init_uart(self.baud_rate)  # 使用当前设置的波特率
         elif self.transmission_mode == 'wireless':
             return self.init_wireless()
         else:  # hybrid mode
-            uart_success = self.init_uart()
+            uart_success = self.init_uart(400000)  # 握手信号使用400K
             wireless_success = self.init_wireless()
             return uart_success and wireless_success
     
-    def init_uart(self):
+    def init_uart(self, baud_rate):
         """Initialize UART serial port"""
         try:
             # Optimize UART settings for higher performance
             self.ser_sender = serial.Serial(
                 SENDER_PORT, 
-                self.baud_rate, 
+                baud_rate, 
                 timeout=0.5,
                 write_timeout=1.0,
                 # Disable software flow control for better throughput
@@ -352,7 +488,7 @@ class WebPSender:
             self.ser_sender.reset_input_buffer()
             self.ser_sender.reset_output_buffer()
             
-            print(f"✅ Sender serial port initialization successful ({SENDER_PORT} @ {self.baud_rate}bps)")
+            print(f"✅ Sender serial port initialization successful ({SENDER_PORT} @ {baud_rate}bps)")
             
             # Apply UART speed optimizations
             self._apply_uart_speed_optimizations()
@@ -431,21 +567,63 @@ class WebPSender:
     def init_wireless(self):
         """Initialize wireless connection"""
         try:
-            # Create TCP server socket
+            # Create TCP server socket with optimizations
             self.wireless_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.wireless_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.wireless_socket.bind((WIRELESS_HOST, WIRELESS_PORT))
-            self.wireless_socket.listen(1)
             
+            # 性能优化
+            if self.baud_rate >= 1000000:
+                # 对于高速网络，启用更多优化
+                # 设置更大的发送缓冲区
+                self.wireless_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, TCP_BUFFER_SIZE)
+                
+                # 禁用Nagle算法，减少延迟
+                if TCP_NODELAY:
+                    self.wireless_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                
+                # 设置socket超时
+                self.wireless_socket.settimeout(SOCKET_TIMEOUT)
+                
+                print(f"🔧 TCP Socket optimized for high-speed transmission:")
+                print(f"   - Send buffer: {TCP_BUFFER_SIZE/1024:.0f}KB")
+                print(f"   - TCP_NODELAY: {TCP_NODELAY}")
+                print(f"   - Timeout: {SOCKET_TIMEOUT}s")
+            
+            # 服务器角色 - 绑定和监听连接
             print(f"🌐 Wireless server started, waiting for connection...")
             print(f"   Address: {WIRELESS_HOST}:{WIRELESS_PORT}")
             print(f"   Speed: {self.baud_rate/1000}K bps")
             
-            # Wait for client connection
-            self.client_socket, client_address = self.wireless_socket.accept()
-            print(f"✅ Client connected: {client_address}")
+            # 绑定地址
+            self.wireless_socket.bind((WIRELESS_HOST, WIRELESS_PORT))
             
-            return True
+            # 开始监听
+            self.wireless_socket.listen(1)
+            
+            # 设置更长的连接接受超时
+            self.wireless_socket.settimeout(10.0)  # 10秒连接超时
+            
+            # 等待客户端连接
+            print("   Waiting for receiver to connect... (10s timeout)")
+            try:
+                self.client_socket, client_address = self.wireless_socket.accept()
+                print(f"✅ Client connected: {client_address}")
+                
+                # 为客户端连接设置优化参数
+                if self.baud_rate >= 1000000:
+                    # 设置非阻塞模式
+                    self.client_socket.setblocking(False)
+                    
+                    # 这些设置可能不会全部生效，因为连接已经建立，但尝试应用
+                    try:
+                        self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except:
+                        pass
+                
+                return True
+            except socket.timeout:
+                print("❌ Connection timed out. Make sure the receiver is running and trying to connect.")
+                return False
         except Exception as e:
             print(f"❌ Wireless initialization failed: {e}")
             return False
@@ -454,18 +632,38 @@ class WebPSender:
         """Optimized WebP encoding"""
         try:
             # Convert to PIL Image
-            pil_image = Image.fromarray(frame)
+            if len(frame.shape) == 3:  # 彩色图像
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            else:  # 灰度图像
+                pil_image = Image.fromarray(frame)
             
-            # WebP compression (using optimized parameters)
-            buffer = io.BytesIO()
-            pil_image.save(
-                buffer, 
-                format='WebP', 
-                quality=self.current_quality,
-                method=self.webp_method,
-                lossless=False,
-                exact=False  # Allow quality adjustment for better compression
-            )
+            # 根据是否是1MHz优化模式选择不同的编码参数
+            if self.optimized_for_1mhz:
+                # 1MHz模式下的优化编码参数
+                buffer = io.BytesIO()
+                pil_image.save(
+                    buffer, 
+                    format='WebP', 
+                    quality=self.current_quality,
+                    method=self.webp_method,
+                    lossless=False,
+                    exact=False,  # Allow quality adjustment for better compression
+                    # 添加更多优化参数
+                    minimize_size=True,  # 最小化文件大小
+                    kmin=2,  # 降低最小分区大小以提高压缩率
+                    kmax=4   # 限制最大分区以保持速度
+                )
+            else:
+                # 常规WebP压缩
+                buffer = io.BytesIO()
+                pil_image.save(
+                    buffer, 
+                    format='WebP', 
+                    quality=self.current_quality,
+                    method=self.webp_method,
+                    lossless=False,
+                    exact=False  # Allow quality adjustment for better compression
+                )
             
             webp_data = buffer.getvalue()
             
@@ -535,23 +733,65 @@ class WebPSender:
                     print(f"⚠️ Incomplete send: {bytes_written}/{len(packet)} bytes")
                     return False
             elif self.transmission_mode == 'wireless':
-                # Wireless mode - Control UART rate
-                if self.wireless_controller:
-                    delay = self.wireless_controller.calculate_delay(len(packet))
-                    if delay > 0:
-                        time.sleep(delay)
+                # 高速模式 (>1MHz) - 完全不等待，最大限度利用网络
+                if self.baud_rate >= 2000000:
+                    # 直接发送，不等待
+                    try:
+                        # 尝试非阻塞发送
+                        self.client_socket.sendall(packet)
+                    except socket.error as e:
+                        if str(e).find('10035') >= 0:  # WSAEWOULDBLOCK
+                            # 如果缓冲区已满，等待一小段时间
+                            time.sleep(0.001)
+                            return True  # 仍然视为成功
+                        else:
+                            print(f"⚠️ Socket send warning: {e}")
+                            time.sleep(0.01)
+                            return False
+                # Wireless mode - 优化1MHz传输
+                elif self.baud_rate == 1000000 and self.optimized_for_1mhz:
+                    # 1MHz优化模式：减少速率控制的限制，增加突发传输能力
+                    if self.wireless_controller:
+                        delay = self.wireless_controller.calculate_delay(len(packet))
+                        # 减少等待时间以提高吞吐量
+                        if delay > 0:
+                            time.sleep(delay * 0.7)  # 只等待计算延迟的70%
+                else:
+                    # 常规模式
+                    if self.wireless_controller:
+                        delay = self.wireless_controller.calculate_delay(len(packet))
+                        if delay > 0:
+                            time.sleep(delay)
                 
-                # Send data
-                self.client_socket.sendall(packet)
+                # 使用更大的发送缓冲区
+                try:
+                    self.client_socket.sendall(packet)
+                except socket.error as e:
+                    print(f"⚠️ Socket send warning: {e}")
+                    time.sleep(0.01)
+                    return False
             else:  # hybrid mode - send video data over wireless
-                # Control UART rate for wireless
-                if self.wireless_controller:
-                    delay = self.wireless_controller.calculate_delay(len(packet))
-                    if delay > 0:
-                        time.sleep(delay)
+                # 同样优化1MHz传输
+                if self.baud_rate == 1000000 and self.optimized_for_1mhz:
+                    # 1MHz优化模式
+                    if self.wireless_controller:
+                        delay = self.wireless_controller.calculate_delay(len(packet))
+                        if delay > 0:
+                            time.sleep(delay * 0.7)  # 只等待计算延迟的70%
+                else:
+                    # 常规模式
+                    if self.wireless_controller:
+                        delay = self.wireless_controller.calculate_delay(len(packet))
+                        if delay > 0:
+                            time.sleep(delay)
                 
-                # Send data over wireless
-                self.client_socket.sendall(packet)
+                # 使用更大的发送缓冲区
+                try:
+                    self.client_socket.sendall(packet)
+                except socket.error as e:
+                    print(f"⚠️ Socket send warning: {e}")
+                    time.sleep(0.01)
+                    return False
             
             self.stats['frames_sent'] += 1
             self.stats['bytes_sent'] += len(packet)
@@ -567,9 +807,12 @@ class WebPSender:
     def send_handshake_packet(self):
         """Send handshake packet over UART in hybrid mode"""
         try:
+            # 检查串口是否可用
+            if not self.ser_sender or not self.ser_sender.is_open:
+                return False
+            
             # 使用预生成的握手包或生成新的
             if len(self.handshake_buffer) > 0 and self.handshake_counter % 10 < 5:
-                # 使用预生成的握手包，每10次使用5次
                 packet_index = self.handshake_counter % 10
                 if USE_SIMPLIFIED_PROTOCOL:
                     packet_size = 6  # Magic(2) + 'HS'(2) + Counter(2)
@@ -627,31 +870,46 @@ class WebPSender:
         
         # 动态调整发送间隔
         dynamic_interval = self.handshake_interval
-        min_interval = 0.03  # 最小30ms
-        max_interval = 0.1   # 最大100ms
+        min_interval = 0.02  # 最小20ms
+        max_interval = 0.05  # 最大50ms
+        
+        # 握手计数器用于调试
+        handshake_send_counter = 0
         
         while self.handshake_running:
             try:
                 current_time = time.time()
                 if current_time >= next_time:
+                    handshake_send_counter += 1
+                    if handshake_send_counter % 20 == 0:  # 每20次打印一次状态
+                        print(f"🤝 Sending handshakes: {handshake_send_counter} (interval: {dynamic_interval*1000:.1f}ms)")
+                    
                     if self.send_handshake_packet():
                         error_count = 0
                         last_success_time = current_time
                         
-                        # 成功发送后，可以适当增加间隔，减少带宽占用
-                        if dynamic_interval < self.handshake_interval:
-                            dynamic_interval = min(self.handshake_interval, dynamic_interval * 1.1)
+                        # 成功发送后，保持稳定的间隔
+                        if dynamic_interval != self.handshake_interval:
+                            dynamic_interval = self.handshake_interval
                     else:
                         error_count += 1
                         # 发送失败时，减少间隔，增加尝试频率
                         dynamic_interval = max(min_interval, dynamic_interval * 0.8)
                         
                         # 如果连续失败超过5次，尝试重置串口
-                        if error_count > 5 and (current_time - last_success_time) > 1.0:
+                        if error_count > 5 and (current_time - last_success_time) > 0.5:
                             print("⚠️ Handshake sending failed multiple times, attempting recovery...")
                             try:
                                 if self.ser_sender and self.ser_sender.is_open:
                                     self.ser_sender.reset_output_buffer()
+                                    # 强制重新初始化串口
+                                    try:
+                                        self.ser_sender.close()
+                                        time.sleep(0.1)
+                                        self.ser_sender.open()
+                                        print("🔄 UART port reset successful")
+                                    except:
+                                        print("❌ Failed to reset UART port")
                             except:
                                 pass
                             error_count = 0
@@ -751,6 +1009,14 @@ class WebPSender:
         print("🚀 WebP sender thread started")
         last_fps_time = time.time()
         frame_count_for_fps = 0
+        bytes_sent_for_bps = 0
+        
+        # 高速模式统计
+        if self.baud_rate >= 1000000:
+            print("📊 Performance monitoring enabled")
+            last_perf_print = time.time()
+            frames_sent_perf = 0
+            bytes_sent_perf = 0
         
         while self.running:
             try:
@@ -766,19 +1032,48 @@ class WebPSender:
                     time.sleep(0.01)
                     continue
                 
-                # Preprocessing (convert to grayscale to reduce data)
-                frame_resized = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
-                gray_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+                # 根据配置决定是否转换为灰度图
+                if self.transmission_mode in ['wireless', 'hybrid'] and self.use_color:
+                    # 无线模式使用彩色图像
+                    frame_resized = cv2.resize(frame, (self.frame_width, self.frame_height))
+                    # 如果需要进行颜色空间转换，例如BGR转RGB
+                    # frame_resized = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                else:
+                    # 有线UART模式或设置为灰度图
+                    frame_resized = cv2.resize(frame, (self.frame_width, self.frame_height))
+                    frame_resized = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
                 
                 # WebP encoding
-                encoded_data = self.encode_frame_webp(gray_frame)
+                encoded_data = self.encode_frame_webp(frame_resized)
                 
                 if encoded_data:
+                    # 性能监控
+                    if self.baud_rate >= 1000000:
+                        current_time = time.time()
+                        
                     # Send
                     if self.send_packet(encoded_data):
                         self.frame_counter += 1
                         self.successful_frames += 1
                         frame_count_for_fps += 1
+                        bytes_sent_for_bps += len(encoded_data)
+                        
+                        # 高速模式性能监控
+                        if self.baud_rate >= 1000000:
+                            frames_sent_perf += 1
+                            bytes_sent_perf += len(encoded_data)
+                            
+                            # 每5秒打印一次性能信息
+                            if current_time - last_perf_print >= 5.0:
+                                elapsed = current_time - last_perf_print
+                                fps = frames_sent_perf / elapsed
+                                bps = bytes_sent_perf * 8 / elapsed
+                                utilization = (bps / self.baud_rate) * 100
+                                print(f"⚡ Performance: {fps:.1f} fps, {bps/1000:.0f} kbps ({utilization:.1f}% of {self.baud_rate/1000:.0f}K)")
+                                frames_sent_perf = 0
+                                bytes_sent_perf = 0
+                                last_perf_print = current_time
+                        
                         self.last_successful_time = time.time()
                         self.error_count = 0
                         
@@ -859,7 +1154,7 @@ class WebPSender:
         
         print("🚀 WebP sender started successfully")
         print("📊 Performance mode: " + self.mode_description)
-        print("📷 Camera resolution: " + str(FRAME_WIDTH) + "x" + str(FRAME_HEIGHT))
+        print("📷 Camera resolution: " + str(self.frame_width) + "x" + str(self.frame_height))
         print("🔄 Transmission mode: " + self.transmission_mode.upper())
         
         return True

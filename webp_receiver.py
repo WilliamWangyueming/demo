@@ -34,7 +34,7 @@ def select_transmission_mode():
         elif choice == '2':
             return select_wireless_speed()
         elif choice == '3':
-            return 'hybrid', 400000
+            return 'hybrid', 2000000  # 视频传输使用2MHz，握手信号使用400K
         else:
             print("❌ Invalid choice, please enter 1, 2, or 3")
 
@@ -86,10 +86,23 @@ RECEIVER_PORT = 'COM8'      # Receiver port (modify according to actual situatio
 WIRELESS_HOST = '127.0.0.1'  # Server IP (localhost for same computer testing)
 WIRELESS_PORT = 8888         # Wireless port
 
+# Connection role
+WIRELESS_ROLE = 'client'     # 接收端作为客户端
+
+# TCP Socket optimizations
+TCP_NODELAY = True           # 禁用Nagle算法，减少延迟
+TCP_BUFFER_SIZE = 524288     # 设置更大的接收缓冲区 (512KB)
+SOCKET_TIMEOUT = 0.1         # Socket超时设置，100ms
+
 # Display configuration
 WINDOW_NAME = 'WebP Video Receiver'  # Display window name
 SHOW_STATS = True           # Whether to show statistics
 AUTO_RESIZE = True          # Whether to auto-resize window
+
+# 图像配置
+WIRELESS_FRAME_WIDTH = 640  # 无线模式帧宽度
+WIRELESS_FRAME_HEIGHT = 480 # 无线模式帧高度
+USE_COLOR_FOR_WIRELESS = True  # 无线模式使用彩色图像
 
 # Buffer configuration
 FRAME_BUFFER_SIZE = 3       # Frame buffer size
@@ -121,8 +134,8 @@ class WebPReceiver:
         # Hybrid mode
         self.handshake_thread = None
         self.handshake_running = False
-        self.last_handshake_time = 0
-        self.handshake_timeout = 1.0  # 增加到1秒，允许更长的中断时间
+        self.last_handshake_time = time.time()  # 初始化为当前时间而不是0
+        self.handshake_timeout = 0.5  # 减少到0.5秒，确保快速检测到断开
         self.handshake_active = False
         self.handshake_counter = 0
         self.last_handshake_id = 0
@@ -153,6 +166,50 @@ class WebPReceiver:
             'frames_skipped': 0  # 新增：因handshake不活跃而跳过的帧数
         }
         
+        # 性能优化标志
+        self.is_high_performance = False
+        self.is_1mhz_mode = False
+        self.is_high_speed = False  # 高速模式 (>=2MHz)
+        
+        # 添加解码和显示优化的配置
+        if baud_rate == 1000000:
+            self.is_1mhz_mode = True
+            self.is_high_performance = True
+            print("🔥 1MHz HIGH PERFORMANCE MODE ENABLED")
+        elif baud_rate >= 2000000:
+            self.is_high_speed = True
+            self.is_high_performance = True
+            print(f"⚡ {baud_rate/1000000:.1f}MHz HIGH SPEED MODE ENABLED")
+        elif baud_rate >= 500000:
+            self.is_high_performance = True
+            print("🚀 HIGH PERFORMANCE MODE ENABLED")
+            
+        # Buffer configuration - 高性能模式使用更大的缓冲区
+        if self.is_high_speed:
+            self.frame_buffer_size = 10  # 高速模式使用更大的帧缓冲区
+        elif self.is_high_performance:
+            self.frame_buffer_size = 5   # 高性能模式使用中等帧缓冲区
+        else:
+            self.frame_buffer_size = FRAME_BUFFER_SIZE
+        
+        # 接收缓冲区 - 用于提高1MHz接收效率
+        if self.is_1mhz_mode:
+            self.recv_buffer = bytearray(65536)  # 64KB接收缓冲区
+            self.recv_buffer_pos = 0
+        
+        # 无线模式的彩色图像支持
+        self.is_wireless_mode = self.transmission_mode in ['wireless', 'hybrid']
+        self.use_color = self.is_wireless_mode and USE_COLOR_FOR_WIRELESS
+        self.high_res = self.is_wireless_mode
+        
+        if self.high_res:
+            self.frame_width = WIRELESS_FRAME_WIDTH
+            self.frame_height = WIRELESS_FRAME_HEIGHT
+            print(f"- Higher resolution support: {self.frame_width}x{self.frame_height}")
+        
+        if self.use_color:
+            print("- Color image support enabled")
+        
     def init_devices(self):
         """Initialize devices"""
         print("🚀 Initializing WebP video receiver...")
@@ -163,23 +220,42 @@ class WebPReceiver:
         print("- Automatic error recovery")
         print(f"- Supports {self.transmission_mode.upper()} transmission mode")
         
+        # 无线模式的彩色图像支持
+        self.is_wireless_mode = self.transmission_mode in ['wireless', 'hybrid']
+        self.use_color = self.is_wireless_mode and USE_COLOR_FOR_WIRELESS
+        self.high_res = self.is_wireless_mode
+        
+        if self.high_res:
+            self.frame_width = WIRELESS_FRAME_WIDTH
+            self.frame_height = WIRELESS_FRAME_HEIGHT
+            print(f"- Higher resolution support: {self.frame_width}x{self.frame_height}")
+        
+        if self.use_color:
+            print("- Color image support enabled")
+        
+        if self.is_1mhz_mode:
+            print("🔥 1MHz OPTIMIZED MODE: Enhanced for maximum frame rate")
+            print("- Optimized receive buffer management")
+            print("- Faster decode and render pipeline")
+            print("- Bandwidth efficiency monitoring")
+        
         # Initialize communication according to transmission mode
         if self.transmission_mode == 'uart':
-            return self.init_uart()
+            return self.init_uart(self.baud_rate)  # 使用当前设置的波特率
         elif self.transmission_mode == 'wireless':
             return self.init_wireless()
         else:  # hybrid mode
-            uart_success = self.init_uart()
+            uart_success = self.init_uart(400000)  # 握手信号使用400K
             wireless_success = self.init_wireless()
             return uart_success and wireless_success
     
-    def init_uart(self):
+    def init_uart(self, baud_rate):
         """Initialize UART serial port"""
         try:
             # Optimize UART settings for higher performance
             self.ser_receiver = serial.Serial(
                 RECEIVER_PORT, 
-                self.baud_rate, 
+                baud_rate, 
                 timeout=RECEIVE_TIMEOUT,
                 # Disable software flow control for better throughput
                 xonxoff=False,
@@ -192,7 +268,7 @@ class WebPReceiver:
             self.ser_receiver.reset_input_buffer()
             self.ser_receiver.reset_output_buffer()
             
-            print(f"✅ Receiver serial port initialization successful ({RECEIVER_PORT} @ {self.baud_rate}bps)")
+            print(f"✅ Receiver serial port initialization successful ({RECEIVER_PORT} @ {baud_rate}bps)")
             
             return True
         except Exception as e:
@@ -203,19 +279,49 @@ class WebPReceiver:
     def init_wireless(self):
         """Initialize wireless connection"""
         try:
-            # Create TCP client socket
+            # 创建TCP客户端socket并进行优化
             self.wireless_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            # 优化socket配置 - 对于高性能模式
+            if self.is_high_performance:
+                # 设置更大的接收缓冲区
+                self.wireless_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, TCP_BUFFER_SIZE)
+                # 禁用Nagle算法，减少延迟
+                self.wireless_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # 设置超时
+                self.wireless_socket.settimeout(SOCKET_TIMEOUT)
+                print("🔧 Socket optimized for high performance")
+                print(f"   - Receive buffer: {TCP_BUFFER_SIZE/1024:.0f}KB")
+                print(f"   - TCP_NODELAY: {TCP_NODELAY}")
+                print(f"   - Timeout: {SOCKET_TIMEOUT*1000:.0f}ms")
             
             print(f"🌐 Connecting to wireless sender...")
             print(f"   Address: {WIRELESS_HOST}:{WIRELESS_PORT}")
             print(f"   Speed: {self.baud_rate/1000}K bps")
             
             # Connect to server
-            self.wireless_socket.connect((WIRELESS_HOST, WIRELESS_PORT))
+            self.wireless_socket.settimeout(10.0)  # 设置更长的连接超时时间
+            print("   Trying to connect to sender... (10s timeout)")
+            
+            try:
+                self.wireless_socket.connect((WIRELESS_HOST, WIRELESS_PORT))
+            except ConnectionRefusedError:
+                print("❌ Connection refused. Make sure the sender is running first.")
+                return False
+            except socket.timeout:
+                print("❌ Connection timed out. Make sure the sender is running.")
+                return False
+            
+            # 对于高速模式，设置非阻塞模式
+            if self.is_high_speed:
+                self.wireless_socket.setblocking(False)
+                print("   - Non-blocking mode enabled")
+            
             print(f"✅ Connected to sender: {WIRELESS_HOST}:{WIRELESS_PORT}")
             
             # Set receive timeout
-            self.wireless_socket.settimeout(RECEIVE_TIMEOUT)
+            if not self.is_high_speed:  # 非高速模式使用超时
+                self.wireless_socket.settimeout(RECEIVE_TIMEOUT)
             
             return True
         except Exception as e:
@@ -225,15 +331,50 @@ class WebPReceiver:
     def decode_frame_webp(self, webp_data):
         """WebP frame decoding"""
         try:
-            # Use PIL to decode WebP
-            pil_image = Image.open(io.BytesIO(webp_data))
-            frame = np.array(pil_image)
-            
-            # Ensure grayscale image
-            if len(frame.shape) == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            
-            return frame
+            # 使用优化的解码方法
+            if self.is_high_performance:
+                # 优化解码过程
+                start_time = time.time()
+                
+                # 使用PIL进行快速解码
+                pil_image = Image.open(io.BytesIO(webp_data))
+                frame = np.array(pil_image)
+                
+                # 检查是否为彩色图像
+                if len(frame.shape) == 3 and self.use_color:
+                    # 彩色图像，可能需要颜色空间转换
+                    if frame.shape[2] == 3:  # RGB
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                elif len(frame.shape) == 3 and not self.use_color:
+                    # 不需要彩色但收到了彩色图像，转换为灰度
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                elif len(frame.shape) == 2 and self.use_color:
+                    # 需要彩色但收到了灰度图，转换为彩色
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                
+                decode_time = (time.time() - start_time) * 1000
+                if decode_time > 10:  # 超过10ms记录一下
+                    print(f"⚠️ Slow decode: {decode_time:.1f}ms for {len(webp_data)} bytes")
+                
+                return frame
+            else:
+                # 标准解码方法
+                pil_image = Image.open(io.BytesIO(webp_data))
+                frame = np.array(pil_image)
+                
+                # 处理颜色转换
+                if len(frame.shape) == 3 and self.use_color:
+                    # 彩色图像处理
+                    if frame.shape[2] == 3:  # RGB
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                elif len(frame.shape) == 3 and not self.use_color:
+                    # 转换为灰度
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                elif len(frame.shape) == 2 and self.use_color:
+                    # 转换为彩色
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                
+                return frame
             
         except Exception as e:
             print(f"❌ WebP decoding failed: {e}")
@@ -407,6 +548,11 @@ class WebPReceiver:
     def receive_packet_wireless(self):
         """Wireless method to receive data packet"""
         try:
+            # 1MHz模式使用特殊优化的接收方法
+            if self.is_1mhz_mode:
+                return self._receive_packet_wireless_optimized()
+            
+            # 普通模式使用原始接收方法
             # Find magic number
             buffer = bytearray()
             magic_found = False
@@ -543,9 +689,182 @@ class WebPReceiver:
             self.stats['errors'] += 1
             return None, None
     
+    def _receive_packet_wireless_optimized(self):
+        """优化的无线数据包接收方法 - 专为1MHz模式设计"""
+        try:
+            # 高速模式 (>=2MHz) 使用特殊优化
+            if self.is_high_speed:
+                try:
+                    # 尝试非阻塞接收
+                    try:
+                        chunk = self.wireless_socket.recv(65536)  # 尝试一次性接收大量数据
+                    except socket.error as e:
+                        if str(e).find('10035') >= 0:  # WSAEWOULDBLOCK
+                            # 没有数据可用，不是错误
+                            return None, None
+                        else:
+                            # 其他错误
+                            raise e
+                    
+                    if not chunk:
+                        return None, None
+                    
+                    # 添加到缓冲区
+                    self.recv_buffer[self.recv_buffer_pos:self.recv_buffer_pos+len(chunk)] = chunk
+                    self.recv_buffer_pos += len(chunk)
+                    
+                    # 查找完整的包
+                    return self._find_packet_in_buffer()
+                    
+                except Exception as e:
+                    if not str(e).find('10035') >= 0:  # 不是WSAEWOULDBLOCK
+                        print(f"⚠️ High speed receive error: {e}")
+                    return None, None
+            
+            # 1MHz模式优化
+            try:
+                # 将数据接收到缓冲区
+                self.wireless_socket.settimeout(0.01)  # 10ms超时，减少等待时间
+                bytes_received = self.wireless_socket.recv_into(
+                    memoryview(self.recv_buffer)[self.recv_buffer_pos:], 
+                    len(self.recv_buffer) - self.recv_buffer_pos
+                )
+                
+                if bytes_received <= 0:
+                    return None, None
+                
+                # 更新缓冲区位置
+                self.recv_buffer_pos += bytes_received
+                
+                # 如果缓冲区将满，重置
+                if self.recv_buffer_pos > 60000:  # 接近缓冲区上限
+                    # 在重置前尝试查找一个完整的包
+                    packet_data, packet_type = self._find_packet_in_buffer()
+                    if packet_data:
+                        return packet_data, packet_type
+                    
+                    # 如果没有找到完整包，将最后100字节保留到缓冲区开头
+                    last_bytes = self.recv_buffer[self.recv_buffer_pos-100:self.recv_buffer_pos]
+                    self.recv_buffer[0:100] = last_bytes
+                    self.recv_buffer_pos = 100
+                    return None, None
+                
+                # 尝试在缓冲区中查找一个完整的数据包
+                return self._find_packet_in_buffer()
+                
+            except socket.timeout:
+                # 超时但缓冲区可能有数据，尝试解析
+                if self.recv_buffer_pos > 0:
+                    return self._find_packet_in_buffer()
+                return None, None
+            except Exception as e:
+                print(f"⚠️ Socket receive warning: {e}")
+                return None, None
+        
+        except Exception as e:
+            print(f"❌ Optimized wireless receive error: {e}")
+            self.stats['errors'] += 1
+            return None, None
+    
+    def _find_packet_in_buffer(self):
+        """在接收缓冲区中查找完整的数据包"""
+        # 在缓冲区中查找魔术字节
+        buffer_view = memoryview(self.recv_buffer)[:self.recv_buffer_pos]
+        buffer_bytes = bytes(buffer_view)
+        magic_pos = buffer_bytes.find(PROTOCOL_MAGIC)
+        
+        if magic_pos == -1:
+            return None, None
+        
+        # 找到魔术字节，开始解析
+        if USE_SIMPLIFIED_PROTOCOL:
+            # 简化协议: Magic(2) + Length(2) + Hash(4) + Data
+            header_size = len(PROTOCOL_MAGIC) + 2 + 4  # Magic + Length + Hash
+            
+            # 确保有足够的数据解析头部
+            if magic_pos + header_size > self.recv_buffer_pos:
+                # 将找到的不完整包移到缓冲区开头
+                incomplete_data = self.recv_buffer[magic_pos:self.recv_buffer_pos]
+                self.recv_buffer[0:len(incomplete_data)] = incomplete_data
+                self.recv_buffer_pos = len(incomplete_data)
+                return None, None
+            
+            # 解析包长度
+            length_bytes = buffer_bytes[magic_pos+len(PROTOCOL_MAGIC):magic_pos+len(PROTOCOL_MAGIC)+2]
+            packet_length = struct.unpack('<H', length_bytes)[0]
+            
+            # 验证包长度
+            if packet_length > 10000 or packet_length < 50:
+                # 无效的包长度，丢弃这个魔术字节
+                new_buffer = buffer_bytes[magic_pos+len(PROTOCOL_MAGIC):]
+                new_magic_pos = new_buffer.find(PROTOCOL_MAGIC)
+                if new_magic_pos != -1:
+                    # 在剩余数据中找到了新的魔术字节
+                    self.recv_buffer[0:len(new_buffer)-new_magic_pos] = new_buffer[new_magic_pos:]
+                    self.recv_buffer_pos = len(new_buffer) - new_magic_pos
+                else:
+                    # 没有找到新的魔术字节，清空缓冲区
+                    self.recv_buffer_pos = 0
+                return None, None
+            
+            # 检查是否有完整的包
+            total_packet_size = magic_pos + header_size + packet_length
+            if total_packet_size > self.recv_buffer_pos:
+                # 包不完整，继续等待数据
+                return None, None
+            
+            # 提取哈希值和数据
+            expected_hash = buffer_bytes[magic_pos+len(PROTOCOL_MAGIC)+2:magic_pos+len(PROTOCOL_MAGIC)+2+4]
+            packet_data = buffer_bytes[magic_pos+header_size:magic_pos+header_size+packet_length]
+            
+            # 验证哈希
+            actual_hash = self.calculate_frame_hash(packet_data)
+            if actual_hash != expected_hash:
+                # 哈希验证失败，丢弃这个包
+                new_buffer = buffer_bytes[magic_pos+len(PROTOCOL_MAGIC):]
+                new_magic_pos = new_buffer.find(PROTOCOL_MAGIC)
+                if new_magic_pos != -1:
+                    # 在剩余数据中找到了新的魔术字节
+                    self.recv_buffer[0:len(new_buffer)-new_magic_pos] = new_buffer[new_magic_pos:]
+                    self.recv_buffer_pos = len(new_buffer) - new_magic_pos
+                else:
+                    # 没有找到新的魔术字节，将指针移动到当前包之后
+                    remaining = buffer_bytes[total_packet_size:]
+                    self.recv_buffer[0:len(remaining)] = remaining
+                    self.recv_buffer_pos = len(remaining)
+                self.stats['errors'] += 1
+                return None, None
+            
+            # 更新接收缓冲区 - 移除已处理的包
+            remaining = buffer_bytes[total_packet_size:]
+            self.recv_buffer[0:len(remaining)] = remaining
+            self.recv_buffer_pos = len(remaining)
+            
+            # 更新统计信息
+            self.stats['frames_received'] += 1
+            self.stats['bytes_received'] += len(packet_data)
+            self.stats['packet_sizes'].append(len(packet_data))
+            self.last_successful_time = time.time()
+            self.error_count = 0
+            
+            return packet_data, PACKET_TYPE
+        else:
+            # 原始协议处理 - 简化起见，不再详细实现
+            # 如果需要支持原始协议，可以参考上面的逻辑进行实现
+            
+            return None, None
+    
     def receive_handshake_packet(self):
         """Receive handshake packet over UART in hybrid mode"""
         try:
+            # 检查串口是否可用
+            if not self.ser_receiver or not self.ser_receiver.is_open:
+                return False
+            
+            # 检查是否有数据可读
+            if self.ser_receiver.in_waiting == 0:
+                return False
+            
             # Find magic number with optimized reading strategy
             buffer = bytearray()
             magic_found = False
@@ -681,13 +1000,13 @@ class WebPReceiver:
         frames_processed = 0
         current_time = time.time()
         
-        # 只处理不超过200ms的帧，太旧的帧直接丢弃
+        # 只处理不超过100ms的帧，太旧的帧直接丢弃
         while self.pending_frames:
             frame_data = self.pending_frames.popleft()
             frame_age = current_time - frame_data['timestamp']
             
             # 如果帧太旧，就丢弃
-            if frame_age > 0.2:  # 200ms
+            if frame_age > 0.1:  # 100ms
                 self.stats['frames_skipped'] += 1
                 continue
                 
@@ -714,9 +1033,13 @@ class WebPReceiver:
         status_interval = 1.0  # 每秒最多打印一次状态
         
         # 健康度计算参数
-        health_decay_rate = 5  # 每100ms衰减的健康度
-        health_recovery_rate = 20  # 每次收到握手包恢复的健康度
+        health_decay_rate = 10  # 每100ms衰减的健康度 - 增加衰减速率
+        health_recovery_rate = 30  # 每次收到握手包恢复的健康度 - 增加恢复速率
         last_health_update = time.time()
+        
+        # 初始化连接状态为初始化中
+        self.connection_state = "INITIALIZING"
+        self.handshake_health = 50  # 初始健康度设为50
         
         while self.handshake_running:
             try:
@@ -739,6 +1062,9 @@ class WebPReceiver:
                         old_state = self.connection_state
                         self.connection_state = "GOOD"
                         print(f"📈 Connection state: {old_state} → GOOD (Health: {self.handshake_health}%)")
+                    
+                    # 收到握手包后立即处理待显示的帧
+                    self.process_pending_frames()
                 else:
                     # 计算健康度衰减
                     time_since_update = current_time - last_health_update
@@ -747,6 +1073,14 @@ class WebPReceiver:
                         self.handshake_health = max(0, self.handshake_health - decay)
                         last_health_update = current_time
                     
+                    # 计算自上次握手包以来的时间
+                    time_since_last_handshake = current_time - self.last_handshake_time
+                    
+                    # 根据健康度和握手超时更新连接状态
+                    if time_since_last_handshake > self.handshake_timeout:
+                        # 超时，强制降低健康度
+                        self.handshake_health = max(0, self.handshake_health - 30)  # 大幅降低健康度
+                    
                     # 根据健康度更新连接状态
                     if self.handshake_health <= 0:
                         if self.connection_state != "LOST":
@@ -754,6 +1088,9 @@ class WebPReceiver:
                             self.connection_state = "LOST"
                             self.handshake_active = False
                             print(f"📉 Connection state: {old_state} → LOST (Health: 0%)")
+                            
+                            # 连接丢失时清空待显示帧队列
+                            self.pending_frames.clear()
                     elif self.handshake_health < 50:
                         if self.connection_state != "DEGRADED":
                             old_state = self.connection_state
@@ -762,8 +1099,9 @@ class WebPReceiver:
                 
                 # 定期打印状态
                 if current_time - last_status_print > status_interval:
+                    time_since_last = (current_time - self.last_handshake_time) * 1000  # 转换为毫秒
                     print(f"🤝 Connection: {self.connection_state}, Health: {self.handshake_health}%, " +
-                          f"Time since last handshake: {(current_time - self.last_handshake_time)*1000:.0f}ms")
+                          f"Time since last handshake: {time_since_last:.0f}ms")
                     last_status_print = current_time
                 
                 # 短暂休眠
@@ -777,10 +1115,46 @@ class WebPReceiver:
         """Receiver thread"""
         print("🚀 WebP receiver thread started")
         
+        # 高性能模式性能监控
+        if self.is_high_performance:
+            last_perf_print = time.time()
+            frames_since_last = 0
+            bytes_since_last = 0
+            
+            # 高速模式使用更频繁的性能打印
+            if self.is_high_speed:
+                perf_interval = 3.0  # 每3秒打印一次性能信息
+            else:
+                perf_interval = 5.0  # 每5秒打印一次性能信息
+        
         while self.running:
             try:
                 packet_data, packet_type = self.receive_packet()
                 if packet_data and packet_type == PACKET_TYPE:
+                    # 性能统计
+                    if self.is_high_performance:
+                        frames_since_last += 1
+                        bytes_since_last += len(packet_data)
+                        
+                        # 定期打印性能信息
+                        current_time = time.time()
+                        if current_time - last_perf_print >= perf_interval:
+                            elapsed = current_time - last_perf_print
+                            fps = frames_since_last / elapsed
+                            bps = bytes_since_last * 8 / elapsed
+                            utilization = 0
+                            if self.baud_rate > 0:
+                                utilization = (bps / self.baud_rate) * 100
+                            
+                            if self.is_high_speed:
+                                print(f"⚡ Performance: {fps:.1f} fps, {bps/1000:.0f} kbps ({utilization:.1f}% of {self.baud_rate/1000:.0f}K)")
+                            else:
+                                print(f"📊 Performance: {fps:.1f} fps, {bps/1000:.0f} kbps ({utilization:.1f}% of {self.baud_rate/1000:.0f}K)")
+                            
+                            frames_since_last = 0
+                            bytes_since_last = 0
+                            last_perf_print = current_time
+                    
                     # WebP decoding
                     frame = self.decode_frame_webp(packet_data)
                     if frame is not None:
@@ -803,8 +1177,8 @@ class WebPReceiver:
                             self.hybrid_frame_buffer.append(frame_data)
                             
                             # 根据连接状态决定是否显示
-                            if self.connection_state != "LOST":
-                                # 连接正常或降级状态，显示帧
+                            if self.connection_state == "GOOD":
+                                # 连接正常，直接显示帧
                                 try:
                                     self.received_frames.put_nowait(frame)
                                 except queue.Full:
@@ -813,6 +1187,12 @@ class WebPReceiver:
                                         self.received_frames.put_nowait(frame)
                                     except queue.Empty:
                                         pass
+                            elif self.connection_state == "DEGRADED":
+                                # 连接降级状态，将帧放入待处理队列
+                                self.pending_frames.append(frame_data)
+                            else:  # LOST 或 INITIALIZING
+                                # 连接丢失或初始化中，不显示帧
+                                pass
                         else:
                             # 非Hybrid模式：直接放入显示队列
                             try:
@@ -840,6 +1220,10 @@ class WebPReceiver:
             else:
                 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
             
+            # 如果是高分辨率模式，可以设置初始窗口大小
+            if self.high_res:
+                cv2.resizeWindow(WINDOW_NAME, self.frame_width, self.frame_height)
+            
             print(f"✅ OpenCV window created successfully: {WINDOW_NAME}")
         except Exception as e:
             print(f"❌ OpenCV window creation failed: {e}")
@@ -853,6 +1237,19 @@ class WebPReceiver:
         # 上一帧显示状态
         last_frame_time = time.time()
         
+        # 高性能模式优化
+        if self.is_high_performance:
+            # 预分配内存，避免频繁分配
+            last_frame = None
+            
+            # 高速模式使用最短的等待时间
+            if self.is_high_speed:
+                wait_key_delay = 1
+            else:
+                wait_key_delay = 1
+        else:
+            wait_key_delay = 1
+        
         while self.running:
             try:
                 current_time = time.time()
@@ -864,7 +1261,7 @@ class WebPReceiver:
                         if current_time - last_no_signal_time >= no_signal_interval:
                             self.show_no_signal("CONNECTION LOST")
                             last_no_signal_time = current_time
-                        time.sleep(0.1)
+                        time.sleep(0.05)  # 减少CPU使用
                         continue
                     
                     # 连接降级但未丢失，继续尝试显示帧
@@ -889,8 +1286,29 @@ class WebPReceiver:
                     continue
                 
                 if frame is not None:
-                    # Convert to color for displaying information
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    # 显示帧处理 - 高性能模式优化
+                    if self.is_high_performance:
+                        # 检查是否需要颜色转换
+                        if len(frame.shape) == 2 and self.use_color:
+                            # 灰度图转BGR
+                            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                        elif len(frame.shape) == 3 and not self.use_color:
+                            # BGR转灰度
+                            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            # 再转回BGR用于显示
+                            frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
+                        elif len(frame.shape) == 3 and frame.shape[2] == 3:
+                            # 已经是BGR格式
+                            frame_bgr = frame
+                        else:
+                            # 默认转换
+                            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    else:
+                        # 标准转换
+                        if len(frame.shape) == 2:
+                            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                        else:
+                            frame_bgr = frame
                     
                     # Add status information
                     if SHOW_STATS:
@@ -906,6 +1324,11 @@ class WebPReceiver:
                     
                     # Display
                     cv2.imshow(WINDOW_NAME, frame_bgr)
+                    
+                    # 更新上一帧
+                    if self.is_high_performance:
+                        last_frame = frame
+                    
                     self.stats['frames_displayed'] += 1
                     frame_count_for_fps += 1
                     
@@ -916,7 +1339,7 @@ class WebPReceiver:
                         last_fps_time = current_time
                         frame_count_for_fps = 0
                     
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                    if cv2.waitKey(wait_key_delay) & 0xFF == ord('q'):
                         self.running = False
                         break
                 
@@ -936,35 +1359,32 @@ class WebPReceiver:
         avg_packet_size = np.mean(list(self.stats['packet_sizes'])) if self.stats['packet_sizes'] else 0
         current_fps = np.mean(list(self.stats['fps_history'])[-3:]) if len(self.stats['fps_history']) >= 3 else 0
         
-        info_lines = [
-            f"Receiver: WebP",
-            f"Compression: {avg_compression:.1f}x",
-            f"FPS: {current_fps:.1f}",
-            f"Packet: {avg_packet_size:.0f}B",
-            f"Received: {self.stats['frames_received']}",
-            f"Displayed: {self.stats['frames_displayed']}",
-            f"Errors: {self.stats['errors']}"
-        ]
-        
-        # Add handshake info for hybrid mode
-        if self.transmission_mode == 'hybrid':
-            connection_colors = {
-                "GOOD": (0, 255, 0),      # 绿色
-                "DEGRADED": (0, 165, 255), # 橙色
-                "LOST": (0, 0, 255),      # 红色
-                "INITIALIZING": (255, 255, 255)  # 白色
-            }
+        # 高性能模式下的优化状态显示
+        if self.is_high_performance:
+            info_lines = [
+                f"FPS: {current_fps:.1f}",
+                f"Packet: {avg_packet_size:.0f}B",
+                f"Compress: {avg_compression:.1f}x",
+                f"Rcv: {self.stats['frames_received']}",
+            ]
             
-            conn_color = connection_colors.get(self.connection_state, (255, 255, 255))
-            
-            info_lines.append(f"Connection: {self.connection_state}")
-            info_lines.append(f"Health: {self.handshake_health}%")
-            info_lines.append(f"Handshakes: {self.stats['handshakes_received']}")
-            
-            # 在右上角添加连接状态指示器
-            status_text = self.connection_state
-            cv2.putText(frame, status_text, (frame.shape[1] - 80, 15), 
-                       font, font_scale, conn_color, thickness)
+            # 对于1MHz模式，添加额外信息
+            if self.is_1mhz_mode:
+                # 计算有效带宽利用率
+                if current_fps > 0 and avg_packet_size > 0:
+                    effective_bitrate = current_fps * avg_packet_size * 8  # bps
+                    utilization = (effective_bitrate / 1000000) * 100  # 相对于1MHz的百分比
+                    info_lines.append(f"Rate: {effective_bitrate/1000:.0f}kbps ({utilization:.0f}%)")
+        else:
+            info_lines = [
+                f"Receiver: WebP",
+                f"Compression: {avg_compression:.1f}x",
+                f"FPS: {current_fps:.1f}",
+                f"Packet: {avg_packet_size:.0f}B",
+                f"Received: {self.stats['frames_received']}",
+                f"Displayed: {self.stats['frames_displayed']}",
+                f"Errors: {self.stats['errors']}"
+            ]
         
         color = (0, 255, 0)  # Green
         
@@ -975,23 +1395,39 @@ class WebPReceiver:
     def show_no_signal(self, message=None):
         """Show no signal status"""
         no_signal = np.zeros((240, 320, 3), dtype=np.uint8)
-        cv2.putText(no_signal, "NO SIGNAL", (80, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        
+        # 如果是高分辨率模式，创建更大的画布
+        if hasattr(self, 'high_res') and self.high_res:
+            no_signal = np.zeros((480, 640, 3), dtype=np.uint8)
+        
+        # 在画布中央显示"NO SIGNAL"
+        h, w = no_signal.shape[:2]
+        text_size = cv2.getTextSize("NO SIGNAL", cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+        text_x = (w - text_size[0]) // 2
+        text_y = (h + text_size[1]) // 2
+        cv2.putText(no_signal, "NO SIGNAL", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         
         if message:
-            cv2.putText(no_signal, message, (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            # 在主消息下方显示附加消息
+            msg_size = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            msg_x = (w - msg_size[0]) // 2
+            msg_y = text_y + 30
+            cv2.putText(no_signal, message, (msg_x, msg_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # 在hybrid模式下，显示更多信息
             if self.transmission_mode == 'hybrid':
                 time_since_last = time.time() - self.last_handshake_time
-                cv2.putText(no_signal, f"Last handshake: {time_since_last*1000:.0f}ms ago", 
-                           (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                cv2.putText(no_signal, f"Connection health: {self.handshake_health}%", 
-                           (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                time_text = f"Last handshake: {time_since_last*1000:.0f}ms ago"
+                cv2.putText(no_signal, time_text, 
+                           (50, msg_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                health_text = f"Connection health: {self.handshake_health}%"
+                cv2.putText(no_signal, health_text, 
+                           (50, msg_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
                 
                 # 显示缓冲区状态
                 buffer_status = f"Buffer: {len(self.hybrid_frame_buffer)}/30 frames"
                 cv2.putText(no_signal, buffer_status, 
-                           (50, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                           (50, msg_y + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         elif self.transmission_mode == 'uart':
             wait_text = "Waiting for UART"
             cv2.putText(no_signal, wait_text, (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
