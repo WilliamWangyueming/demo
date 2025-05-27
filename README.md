@@ -1,271 +1,252 @@
-# WebP视频传输系统 - 双机分离版
+# WebP Video Transmission System
 
-## 🎯 系统概述
+A high-performance WebP video transmission system optimized for UART serial communication, supporting both wired UART and wireless transmission modes.
 
-专为300kbps UART串口通信优化的高性能WebP视频传输系统。通过黑白图像和WebP压缩技术，实现了**104倍压缩比**和**100%传输成功率**。
+## ✨ Features
 
-**新特性**: 发送端和接收端完全分离，可运行在两台不同的电脑上！
+### 🚀 Core Capabilities
+- **Dual Mode Support**: Wired UART (300K bps) and Wireless transmission (up to 5MHz)
+- **Advanced Compression**: WebP encoding with compression ratios up to 104x
+- **Smart Optimization**: Dynamic quality adjustment and intelligent performance scaling
+- **Real-time Monitoring**: Live statistics display and frame rate monitoring
+- **Error Recovery**: Automatic error detection and recovery mechanisms
 
-## 🚀 核心优势
+### 📊 Performance Highlights
+- **Ultra-low Latency**: Optimized for real-time video streaming
+- **Data Efficiency**: Grayscale conversion reduces data by 67%
+- **Smart Buffering**: Prevents frame loss with intelligent queue management
+- **Adaptive Quality**: Dynamic quality adjustment based on transmission conditions
 
-- **双机分离**: 发送端和接收端独立运行，真正的双机通信
-- **超高压缩比**: 104.3倍压缩（远超JPEG的25倍）
-- **数据量减少**: 黑白图像减少67%数据量
-- **智能调优**: 动态质量调整，自适应网络状况
-- **完美兼容**: OpenCV原生支持，无复杂依赖
-- **实时监控**: 帧率、压缩比、成功率实时显示
-- **简单配置**: 顶部配置参数，易于修改
+## 🛠️ System Requirements
 
-## 📁 文件结构
+### Hardware
+- **Camera**: USB camera (index 0 by default)
+- **Serial Ports**: For UART mode communication
+- **Network**: For wireless mode communication
 
-```
-demo/
-├── webp_sender.py              # 发送端程序 (运行在发送端电脑)
-├── webp_receiver.py            # 接收端程序 (运行在接收端电脑)
-├── test_serial_connection.py   # 串口连接测试
-├── webp_performance_tuner.py   # 性能分析工具
-├── DUAL_COMPUTER_SETUP.md      # 双机配置指南
-├── PERFORMANCE_GUIDE.md        # 详细性能调优指南
-├── requirements.txt            # 依赖列表
-└── README.md                   # 本文档
-```
-
-## 🔧 快速开始
-
-### 1. 系统架构
-```
-发送端电脑                    接收端电脑
-┌─────────────────┐          ┌─────────────────┐
-│  webp_sender.py │          │ webp_receiver.py│
-│                 │          │                 │
-│  📹 摄像头       │          │  📺 显示器       │
-│  📡 COM7        │ =======> │  📡 COM8        │
-│                 │  UART    │                 │
-└─────────────────┘  300kbps └─────────────────┘
-```
-
-### 2. 安装依赖 (两台电脑都需要)
+### Software Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. 配置串口
+Required packages:
+- opencv-python>=4.5.0
+- pyserial>=3.5
+- pillow>=8.0.0
+- numpy>=1.20.0
 
-#### 发送端电脑 - 编辑 `webp_sender.py`：
-```python
-# ==================== 配置参数 ====================
-SENDER_PORT = 'COM7'        # 修改为实际的发送端串口
-BAUD_RATE = 300000          # 波特率 300kbps
-CAMERA_INDEX = 0            # 摄像头索引
-PERFORMANCE_MODE = "balanced"  # 性能模式
-```
+## 🚀 Quick Start
 
-#### 接收端电脑 - 编辑 `webp_receiver.py`：
-```python
-# ==================== 配置参数 ====================
-RECEIVER_PORT = 'COM8'      # 修改为实际的接收端串口
-BAUD_RATE = 300000          # 波特率 (必须与发送端一致)
-SHOW_STATS = True           # 是否显示统计信息
-```
-
-### 4. 测试连接
+### 1. Installation
 ```bash
-# 两台电脑都运行
-python test_serial_connection.py
+git clone <repository-url>
+cd webp-video-transmission
+pip install -r requirements.txt
 ```
 
-### 5. 启动系统
+### 2. Basic Usage
 
-#### 先启动接收端：
+#### Sender (Video Source)
 ```bash
-# 接收端电脑
+python webp_sender.py
+```
+
+#### Receiver (Display)
+```bash
 python webp_receiver.py
 ```
 
-#### 再启动发送端：
+### 3. Mode Selection
+When starting either program, you'll be prompted to select transmission mode:
+1. **Wired UART** (300,000 bps) - Traditional serial communication
+2. **Wireless transmission** - High-speed wireless mode with multiple speed options
+
+## 📡 Transmission Modes
+
+### UART Mode (Wired)
+- **Speed**: 300,000 bps
+- **Connection**: Direct serial cable connection
+- **Ports**: COM7 (sender), COM8 (receiver) - configurable
+- **Use Case**: Reliable point-to-point communication
+
+### Wireless Mode
+- **Speed Options**: 1MHz / 2MHz / 5MHz / Custom
+- **Connection**: TCP/IP over WiFi/Ethernet
+- **Port**: 8888 (configurable)
+- **Use Case**: Flexible wireless communication
+
+#### Wireless Speed Modes:
+- **1MHz (Standard)**: Balanced performance, ~25fps
+- **2MHz (High Speed)**: Enhanced FPS and quality, ~30fps  
+- **5MHz (Ultra Speed)**: Maximum performance
+- **Custom**: User-defined speed (100K-10M bps)
+
+## ⚙️ Configuration
+
+### Performance Modes
+Available via command line parameter:
 ```bash
-# 发送端电脑 - 默认平衡模式
-python webp_sender.py
-
-# 或选择其他性能模式
-python webp_sender.py high_fps      # 高帧率模式
-python webp_sender.py high_quality  # 高画质模式
-python webp_sender.py ultra_fast    # 极速模式
+python webp_sender.py [mode]
 ```
 
-## 📊 性能模式
+**Available modes:**
+- `balanced` - Default balanced settings (15→25fps wireless)
+- `high_fps` - High frame rate priority (38→60fps wireless)
+- `high_quality` - High quality priority (11→37fps wireless)  
+- `ultra_fast` - Maximum speed mode (50→60fps wireless)
 
-### 模式对比
-| 模式 | 帧率 | 质量 | 包大小 | 适用场景 |
-|------|------|------|--------|----------|
-| ultra_fast | 50fps | Q30 | 975B | 低延迟要求 |
-| high_fps | 38fps | Q30 | 975B | 实时监控 |
-| balanced | 15fps | Q50 | 1261B | 一般应用 |
-| high_quality | 11fps | Q70 | 1653B | 图像分析 |
+### Key Configuration Variables
 
-### 实测性能
-- **压缩比**: 104.3倍
-- **成功率**: 100%
-- **数据减少**: 67% (黑白图像)
-- **WebP优势**: 比JPEG压缩率高435%
-
-## 🎯 配置说明
-
-### 发送端配置 (`webp_sender.py`)
+#### Sender (`webp_sender.py`)
 ```python
-# 串口配置
-SENDER_PORT = 'COM7'        # Windows: COM1,COM2... Linux: /dev/ttyUSB0...
-BAUD_RATE = 300000          # 波特率
+# Serial Configuration
+SENDER_PORT = 'COM7'
 
-# 摄像头配置  
-CAMERA_INDEX = 0            # 摄像头索引
-FRAME_WIDTH = 320           # 帧宽度
-FRAME_HEIGHT = 240          # 帧高度
+# Wireless Configuration  
+WIRELESS_HOST = '127.0.0.1'
+WIRELESS_PORT = 8888
 
-# 性能模式
-PERFORMANCE_MODE = "balanced"  # high_fps, balanced, high_quality, ultra_fast
+# Camera Configuration
+CAMERA_INDEX = 0
+FRAME_WIDTH = 320
+FRAME_HEIGHT = 240
+
+# Performance Mode
+PERFORMANCE_MODE = "balanced"
 ```
 
-### 接收端配置 (`webp_receiver.py`)
+#### Receiver (`webp_receiver.py`)
 ```python
-# 串口配置
-RECEIVER_PORT = 'COM8'      # 接收端串口
-BAUD_RATE = 300000          # 必须与发送端一致
+# Serial Configuration
+RECEIVER_PORT = 'COM8'
 
-# 显示配置
+# Wireless Configuration
+WIRELESS_HOST = '127.0.0.1'  
+WIRELESS_PORT = 8888
+
+# Display Configuration
 WINDOW_NAME = 'WebP Video Receiver'
-SHOW_STATS = True           # 显示统计信息
-AUTO_RESIZE = True          # 自动调整窗口
-
-# 缓冲配置
-FRAME_BUFFER_SIZE = 3       # 帧缓冲区大小
+SHOW_STATS = True
+AUTO_RESIZE = True
 ```
 
-## 🔍 实时监控
+## 🔧 Advanced Features
 
-### 发送端显示：
+### Smart Quality Adjustment
+The system automatically adjusts video quality based on:
+- **Transmission success rate**
+- **Actual frame rate vs. target**
+- **Packet size optimization**
+- **Network/UART conditions**
+
+### Wireless Mode Optimizations
+- **Intelligent Rate Control**: Mimics UART timing characteristics
+- **Burst Transmission**: Allows temporary speed bursts for better performance
+- **Adaptive Windowing**: Dynamic time windows for different speeds
+- **Performance Scaling**: Automatic parameter optimization based on selected speed
+
+### Error Recovery
+- **Automatic Detection**: Monitors transmission health
+- **Recovery Mode**: Reduces quality/speed when errors detected
+- **Statistics Tracking**: Comprehensive performance monitoring
+
+## 📊 Performance Statistics
+
+### Real-time Monitoring
+Both sender and receiver display live statistics:
+- **Frame Rate**: Current FPS
+- **Compression Ratio**: WebP compression efficiency
+- **Packet Size**: Average data packet size
+- **Success Rate**: Transmission reliability
+- **Error Count**: Failed transmissions
+
+### Video Overlay (Receiver)
+The receiver displays real-time information overlay:
+- Compression ratio
+- Current FPS
+- Packet size
+- Frames received/displayed
+- Error count
+
+## 🌐 Wireless Setup
+
+### Same Computer Testing
+1. Start sender: `python webp_sender.py`
+2. Select "2. Wireless transmission"
+3. Choose speed (1MHz recommended for testing)
+4. Start receiver: `python webp_receiver.py`
+5. Select "2. Wireless transmission"
+6. Choose same speed as sender
+
+### Two Computer Setup
+1. **Sender Computer**:
+   - Modify `WIRELESS_HOST = '0.0.0.0'` (listen on all interfaces)
+   - Run `python webp_sender.py`
+   
+2. **Receiver Computer**:
+   - Modify `WIRELESS_HOST = '<sender_ip_address>'`
+   - Run `python webp_receiver.py`
+
+3. **Firewall**: Ensure port 8888 is allowed through firewall
+
+## 🔍 Troubleshooting
+
+### Common Issues
+
+#### UART Mode
+- **Port not found**: Check COM port numbers and availability
+- **Permission denied**: Ensure ports aren't used by other applications
+- **Connection timeout**: Verify cable connections and port settings
+
+#### Wireless Mode  
+- **Connection refused**: Check firewall settings and IP addresses
+- **High latency**: Try lower speed settings or check network quality
+- **Frame drops**: Increase buffer size or reduce quality settings
+
+### Performance Optimization
+- **Low FPS**: Reduce quality settings or try higher speed wireless mode
+- **High latency**: Use wired mode or optimize network setup
+- **Poor quality**: Increase quality settings or check camera configuration
+
+## 📋 Protocol Specification
+
+### Packet Format
 ```
-📊 发送统计 - 模式:balanced Q:50 压缩比:104.3x 帧率:15.2fps 
-包大小:1261B 发送:1234 成功率:100.0% 状态:正常
-```
-
-### 接收端显示：
-```
-📊 接收统计 - 压缩比:104.3x 帧率:15.1fps 包大小:1261B 
-接收:1234 显示:1234 错误:0
-```
-
-### 视频窗口信息：
-```
-Receiver: WebP          # 接收端类型
-Port: COM8              # 串口
-Compression: 104.3x     # 压缩比
-FPS: 15.1               # 帧率
-Packet: 1261B           # 包大小
-Received: 1234          # 接收帧数
-Displayed: 1234         # 显示帧数
-Errors: 0               # 错误数
-```
-
-## 🛠️ 故障排除
-
-### 1. 串口问题
-```python
-# 查看可用串口
-import serial.tools.list_ports
-ports = serial.tools.list_ports.comports()
-for port in ports:
-    print(f"{port.device}: {port.description}")
-```
-
-### 2. 常见错误
-- **串口未找到**: 检查串口名称配置
-- **权限拒绝**: Linux/macOS需要串口权限
-- **端口占用**: 关闭其他占用串口的程序
-- **摄像头失败**: 检查摄像头索引和权限
-
-### 3. 硬件连接
-```
-发送端 USB-TTL    <==>    接收端 USB-TTL
-    TX (发送)     ------>     RX (接收)
-    RX (接收)     <------     TX (发送)
-    GND (地)      ------      GND (地)
-```
-
-## 📋 配置检查清单
-
-### 发送端：
-- [ ] 串口名称正确 (`SENDER_PORT`)
-- [ ] 摄像头索引正确 (`CAMERA_INDEX`)
-- [ ] 摄像头工作正常
-- [ ] 串口连接正常
-- [ ] 性能模式合适
-
-### 接收端：
-- [ ] 串口名称正确 (`RECEIVER_PORT`)
-- [ ] 波特率一致 (`BAUD_RATE`)
-- [ ] 显示配置合适
-- [ ] 串口连接正常
-
-### 硬件：
-- [ ] TX/RX交叉连接
-- [ ] GND共地连接
-- [ ] USB-TTL转换器工作正常
-- [ ] 线缆连接牢固
-
-## 🎯 最佳实践
-
-### 1. 启动顺序
-1. 先启动接收端 (`webp_receiver.py`)
-2. 等待显示 "NO SIGNAL" 窗口
-3. 再启动发送端 (`webp_sender.py`)
-4. 观察连接建立
-
-### 2. 性能调优
-- 从 `balanced` 模式开始测试
-- 根据实际需求调整模式
-- 观察统计信息进行优化
-- 运行 `webp_performance_tuner.py` 分析
-
-### 3. 错误恢复
-- 系统具有自动错误恢复功能
-- 发送端会自动调整质量
-- 接收端会显示连接状态
-- 出现问题时重启程序即可
-
-## 📞 技术支持
-
-### 详细文档：
-- `DUAL_COMPUTER_SETUP.md` - 双机配置详细指南
-- `PERFORMANCE_GUIDE.md` - 性能调优详细指南
-
-### 测试工具：
-- `test_serial_connection.py` - 串口连接测试
-- `webp_performance_tuner.py` - 性能分析工具
-
-### 常用命令：
-```bash
-# 查看串口设备 (Linux)
-ls /dev/tty*
-
-# 查看串口设备 (Windows)  
-mode
-
-# 测试串口通信
-python test_serial_connection.py
-
-# 性能分析
-python webp_performance_tuner.py
+[Magic(4)] [FrameID(4)] [Length(4)] [Type(8)] [Hash(4)] [Data(variable)]
 ```
 
-## 🎉 系统亮点
+- **Magic**: 'WEBP' (4 bytes)
+- **FrameID**: Incrementing frame counter (4 bytes)
+- **Length**: Data payload length (4 bytes)  
+- **Type**: Packet type identifier (8 bytes)
+- **Hash**: MD5 hash for verification (4 bytes)
+- **Data**: WebP encoded frame data
 
-1. **真正双机分离**: 发送端和接收端完全独立
-2. **简单配置**: 顶部参数配置，易于修改
-3. **超高压缩比**: 104.3倍压缩，远超预期
-4. **完美成功率**: 100%传输成功率
-5. **智能调整**: 自动优化质量和帧率
-6. **实时监控**: 全面的性能指标显示
-7. **多种模式**: 4种性能模式适应不同需求
+### Communication Flow
+1. **Sender**: Captures frame → WebP encode → Package → Transmit
+2. **Receiver**: Receive → Verify → WebP decode → Display
+3. **Flow Control**: Rate limiting based on selected transmission speed
 
-通过这个双机分离系统，你可以在两台电脑之间实现高质量的300kbps WebP视频传输！ 
+## 🧪 Development
+
+### Testing
+- Use same-computer wireless testing for development
+- Monitor statistics for performance analysis
+- Adjust configuration variables for different use cases
+
+### Extending
+- Add new performance modes in `setup_performance_mode()`
+- Modify compression parameters for different quality/speed tradeoffs
+- Implement additional error recovery strategies
+
+## 📝 License
+
+This project is provided as-is for educational and research purposes.
+
+## 🤝 Contributing
+
+Feel free to submit issues and enhancement requests!
+
+---
+
+**Note**: This system is optimized for real-time video transmission scenarios where low latency and efficient bandwidth usage are crucial. The wireless mode provides significant performance improvements over traditional UART while maintaining protocol compatibility. 

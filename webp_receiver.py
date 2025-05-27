@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WebP视频接收端
-专为UART串口通信优化的WebP视频接收程序
-支持有线UART和网络传输两种模式
+WebP Video Receiver
+WebP video reception program optimized for UART serial communication
+Supports both wired UART and wireless transmission modes
 """
 
 import cv2
@@ -19,71 +19,107 @@ import io
 from PIL import Image
 import socket
 
-# ==================== 传输模式选择 ====================
+# ==================== Transmission Mode Selection ====================
 def select_transmission_mode():
-    """选择传输模式"""
-    print("🔧 请选择传输模式:")
-    print("1. 有线UART (300,000 bps)")
-    print("2. 网络传输 (模拟1MHz UART)")
+    """Select transmission mode"""
+    print("🔧 Please select transmission mode:")
+    print("1. Wired UART (300,000 bps)")
+    print("2. Wireless transmission (UART rate)")
     
     while True:
-        choice = input("请输入选择 (1或2): ").strip()
+        choice = input("Please enter choice (1 or 2): ").strip()
         if choice == '1':
-            return 'uart', 300000
+            return 'uart', 400000
         elif choice == '2':
-            return 'network', 1000000  # 1MHz模拟速率
+            return select_wireless_speed()
         else:
-            print("❌ 无效选择，请输入1或2")
+            print("❌ Invalid choice, please enter 1 or 2")
 
-# 默认配置 (将在主函数中选择)
+def select_wireless_speed():
+    """Select wireless speed"""
+    print("\n🌐 Please select wireless speed:")
+    print("1. 1MHz (Standard) - Balanced performance")
+    print("2. 2MHz (High speed) - Enhanced FPS and quality")
+    print("3. 5MHz (Ultra speed) - Maximum performance")
+    print("4. Custom speed")
+    
+    speed_options = {
+        '1': 1000000,   # 1MHz
+        '2': 2000000,   # 2MHz
+        '3': 5000000,   # 5MHz
+    }
+    
+    while True:
+        choice = input("Please enter choice (1-4): ").strip()
+        if choice in speed_options:
+            speed = speed_options[choice]
+            print(f"✅ Selected speed: {speed/1000:.0f}K bps")
+            return 'wireless', speed
+        elif choice == '4':
+            try:
+                custom_speed = int(input("Please enter custom speed (bps, e.g. 3000000): "))
+                if custom_speed < 100000:
+                    print("❌ Speed too low, minimum is 100,000 bps")
+                    continue
+                elif custom_speed > 10000000:
+                    print("❌ Speed too high, maximum is 10,000,000 bps")
+                    continue
+                print(f"✅ Custom speed: {custom_speed/1000:.0f}K bps")
+                return 'wireless', custom_speed
+            except ValueError:
+                print("❌ Please enter a valid number")
+        else:
+            print("❌ Invalid choice, please enter 1-4")
+
+# Default configuration (will be selected in main function)
 TRANSMISSION_MODE = 'uart'
 BAUD_RATE = 300000
 
-# ==================== 配置参数 ====================
-# 串口配置 (UART模式)
-RECEIVER_PORT = 'COM8'      # 接收端串口 (根据实际情况修改)
+# ==================== Configuration Parameters ====================
+# Serial port configuration (UART mode)
+RECEIVER_PORT = 'COM8'      # Receiver port (modify according to actual situation)
 
-# 网络配置 (网络模式)
-NETWORK_HOST = '127.0.0.1'  # 服务器IP (同一台电脑测试用localhost)
-NETWORK_PORT = 8888         # 网络端口
+# Wireless configuration (wireless mode)
+WIRELESS_HOST = '127.0.0.1'  # Server IP (localhost for same computer testing)
+WIRELESS_PORT = 8888         # Wireless port
 
-# 显示配置
-WINDOW_NAME = 'WebP Video Receiver'  # 显示窗口名称
-SHOW_STATS = True           # 是否显示统计信息
-AUTO_RESIZE = True          # 是否自动调整窗口大小
+# Display configuration
+WINDOW_NAME = 'WebP Video Receiver'  # Display window name
+SHOW_STATS = True           # Whether to show statistics
+AUTO_RESIZE = True          # Whether to auto-resize window
 
-# 缓冲配置
-FRAME_BUFFER_SIZE = 3       # 帧缓冲区大小
-STATS_BUFFER_SIZE = 50      # 统计缓冲区大小
+# Buffer configuration
+FRAME_BUFFER_SIZE = 3       # Frame buffer size
+STATS_BUFFER_SIZE = 50      # Statistics buffer size
 
-# 高级配置 (一般不需要修改)
-PROTOCOL_MAGIC = b'WEBP'    # 协议魔数 (必须与发送端一致)
-PACKET_TYPE = "WEBP"        # 数据包类型
-RECEIVE_TIMEOUT = 0.05      # 接收超时时间
+# Advanced configuration (generally no need to modify)
+PROTOCOL_MAGIC = b'WEBP'    # Protocol magic number (must match sender)
+PACKET_TYPE = "WEBP"        # Packet type
+RECEIVE_TIMEOUT = 0.05      # Receive timeout
 # ================================================
 
 class WebPReceiver:
     def __init__(self, transmission_mode=None, baud_rate=None):
         self.running = False
         
-        # 传输相关
+        # Transmission related
         self.transmission_mode = transmission_mode or TRANSMISSION_MODE
         self.baud_rate = baud_rate or BAUD_RATE
         
-        # 串口 (UART模式)
+        # Serial port (UART mode)
         self.ser_receiver = None
         
-        # 网络 (网络模式)
-        self.network_socket = None
+        # Wireless (wireless mode)
+        self.wireless_socket = None
         
-        # 智能缓冲
+        # Smart buffering
         self.received_frames = queue.Queue(maxsize=FRAME_BUFFER_SIZE)
         
-        # 错误恢复
+        # Error recovery
         self.last_successful_time = time.time()
         self.error_count = 0
         
-        # 统计信息
+        # Statistics
         self.stats = {
             'frames_received': 0,
             'frames_displayed': 0,
@@ -95,97 +131,97 @@ class WebPReceiver:
         }
         
     def init_devices(self):
-        """初始化设备"""
-        print("🚀 初始化WebP视频接收端...")
-        print("📊 接收端特性:")
-        print("- WebP解码显示")
-        print("- 智能缓冲防丢帧")
-        print("- 实时统计监控")
-        print("- 错误自动恢复")
-        print(f"- 支持{self.transmission_mode.upper()}传输模式")
+        """Initialize devices"""
+        print("🚀 Initializing WebP video receiver...")
+        print("📊 Receiver features:")
+        print("- WebP decoding and display")
+        print("- Smart buffering to prevent frame loss")
+        print("- Real-time statistics monitoring")
+        print("- Automatic error recovery")
+        print(f"- Supports {self.transmission_mode.upper()} transmission mode")
         
-        # 根据传输模式初始化通信
+        # Initialize communication according to transmission mode
         if self.transmission_mode == 'uart':
             return self.init_uart()
         else:
-            return self.init_network()
+            return self.init_wireless()
     
     def init_uart(self):
-        """初始化UART串口"""
+        """Initialize UART serial port"""
         try:
             self.ser_receiver = serial.Serial(RECEIVER_PORT, self.baud_rate, timeout=RECEIVE_TIMEOUT)
             
-            # 清空缓冲区
+            # Clear buffers
             self.ser_receiver.reset_input_buffer()
             self.ser_receiver.reset_output_buffer()
             
-            print(f"✅ 接收端串口初始化成功 ({RECEIVER_PORT} @ {self.baud_rate}bps)")
+            print(f"✅ Receiver serial port initialization successful ({RECEIVER_PORT} @ {self.baud_rate}bps)")
             return True
         except Exception as e:
-            print(f"❌ 接收端串口初始化失败: {e}")
-            print(f"请检查串口 {RECEIVER_PORT} 是否可用")
+            print(f"❌ Receiver serial port initialization failed: {e}")
+            print(f"Please check if serial port {RECEIVER_PORT} is available")
             return False
     
-    def init_network(self):
-        """初始化网络连接"""
+    def init_wireless(self):
+        """Initialize wireless connection"""
         try:
-            # 创建TCP客户端socket
-            self.network_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Create TCP client socket
+            self.wireless_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             
-            print(f"🌐 正在连接网络发送端...")
-            print(f"   地址: {NETWORK_HOST}:{NETWORK_PORT}")
-            print(f"   模拟速率: {self.baud_rate/1000}K bps")
+            print(f"🌐 Connecting to wireless sender...")
+            print(f"   Address: {WIRELESS_HOST}:{WIRELESS_PORT}")
+            print(f"   Speed: {self.baud_rate/1000}K bps")
             
-            # 连接到服务器
-            self.network_socket.connect((NETWORK_HOST, NETWORK_PORT))
-            print(f"✅ 已连接到发送端: {NETWORK_HOST}:{NETWORK_PORT}")
+            # Connect to server
+            self.wireless_socket.connect((WIRELESS_HOST, WIRELESS_PORT))
+            print(f"✅ Connected to sender: {WIRELESS_HOST}:{WIRELESS_PORT}")
             
-            # 设置接收超时
-            self.network_socket.settimeout(RECEIVE_TIMEOUT)
+            # Set receive timeout
+            self.wireless_socket.settimeout(RECEIVE_TIMEOUT)
             
             return True
         except Exception as e:
-            print(f"❌ 网络连接失败: {e}")
+            print(f"❌ Wireless connection failed: {e}")
             return False
     
     def decode_frame_webp(self, webp_data):
-        """WebP解码帧"""
+        """WebP frame decoding"""
         try:
-            # 使用PIL解码WebP
+            # Use PIL to decode WebP
             pil_image = Image.open(io.BytesIO(webp_data))
             frame = np.array(pil_image)
             
-            # 确保是灰度图像
+            # Ensure grayscale image
             if len(frame.shape) == 3:
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             
             return frame
             
         except Exception as e:
-            print(f"❌ WebP解码失败: {e}")
+            print(f"❌ WebP decoding failed: {e}")
             return None
     
     def calculate_frame_hash(self, frame_data):
-        """计算帧数据哈希用于验证"""
+        """Calculate frame data hash for verification"""
         return hashlib.md5(frame_data).digest()[:4]
     
     def receive_packet(self):
-        """接收数据包"""
+        """Receive data packet"""
         try:
-            # 根据传输模式选择接收方法
+            # Select receiving method according to transmission mode
             if self.transmission_mode == 'uart':
                 return self.receive_packet_uart()
             else:
-                return self.receive_packet_network()
+                return self.receive_packet_wireless()
         except Exception as e:
-            print(f"❌ 接收失败: {e}")
+            print(f"❌ Receive failed: {e}")
             self.stats['errors'] += 1
             self.error_count += 1
             return None, None
     
     def receive_packet_uart(self):
-        """UART方式接收数据包"""
-        # 查找魔数
+        """UART method to receive data packet"""
+        # Find magic number
         buffer = bytearray()
         magic_found = False
         
@@ -206,41 +242,41 @@ class WebPReceiver:
         if not magic_found:
             return None, None
         
-        # 确保有完整的头部 (4+4+4+8+4=24)
+        # Ensure complete header (4+4+4+8+4=24)
         while len(buffer) < 24:
             byte = self.ser_receiver.read(1)
             if not byte:
                 return None, None
             buffer.extend(byte)
         
-        # 解析头部
+        # Parse header
         frame_id = struct.unpack('<I', buffer[4:8])[0]
         packet_length = struct.unpack('<I', buffer[8:12])[0]
         packet_type = buffer[12:20].decode('ascii').strip()
         expected_hash = buffer[20:24]
         
-        # 验证包长度
+        # Verify packet length
         if packet_length > 10000 or packet_length < 50:
-            print(f"⚠️  异常包长度: {packet_length}")
+            print(f"⚠️  Abnormal packet length: {packet_length}")
             return None, None
         
-        # 读取剩余数据
+        # Read remaining data
         remaining = packet_length - (len(buffer) - 24)
         while remaining > 0:
             chunk = self.ser_receiver.read(min(remaining, 1024))
             if not chunk:
-                print(f"⚠️  数据不完整: 还需{remaining}字节")
+                print(f"⚠️  Incomplete data: need {remaining} more bytes")
                 return None, None
             buffer.extend(chunk)
             remaining -= len(chunk)
         
-        # 提取包数据
+        # Extract packet data
         packet_data = bytes(buffer[24:24+packet_length])
         
-        # 验证哈希
+        # Verify hash
         actual_hash = self.calculate_frame_hash(packet_data)
         if actual_hash != expected_hash:
-            print(f"⚠️  包{frame_id}哈希校验失败")
+            print(f"⚠️  Packet {frame_id} hash verification failed")
             self.stats['errors'] += 1
             return None, None
         
@@ -252,16 +288,16 @@ class WebPReceiver:
         
         return packet_data, packet_type
     
-    def receive_packet_network(self):
-        """网络方式接收数据包"""
-        # 查找魔数
+    def receive_packet_wireless(self):
+        """Wireless method to receive data packet"""
+        # Find magic number
         buffer = bytearray()
         magic_found = False
         
         start_time = time.time()
         while not magic_found and (time.time() - start_time) < 0.1:
             try:
-                byte = self.network_socket.recv(1)
+                byte = self.wireless_socket.recv(1)
                 if not byte:
                     break
                     
@@ -280,48 +316,48 @@ class WebPReceiver:
         if not magic_found:
             return None, None
         
-        # 确保有完整的头部 (4+4+4+8+4=24)
+        # Ensure complete header (4+4+4+8+4=24)
         while len(buffer) < 24:
             try:
-                byte = self.network_socket.recv(1)
+                byte = self.wireless_socket.recv(1)
                 if not byte:
                     return None, None
                 buffer.extend(byte)
             except Exception:
                 return None, None
         
-        # 解析头部
+        # Parse header
         frame_id = struct.unpack('<I', buffer[4:8])[0]
         packet_length = struct.unpack('<I', buffer[8:12])[0]
         packet_type = buffer[12:20].decode('ascii').strip()
         expected_hash = buffer[20:24]
         
-        # 验证包长度
+        # Verify packet length
         if packet_length > 10000 or packet_length < 50:
-            print(f"⚠️  异常包长度: {packet_length}")
+            print(f"⚠️  Abnormal packet length: {packet_length}")
             return None, None
         
-        # 读取剩余数据
+        # Read remaining data
         remaining = packet_length - (len(buffer) - 24)
         while remaining > 0:
             try:
-                chunk = self.network_socket.recv(min(remaining, 1024))
+                chunk = self.wireless_socket.recv(min(remaining, 1024))
                 if not chunk:
-                    print(f"⚠️  数据不完整: 还需{remaining}字节")
+                    print(f"⚠️  Incomplete data: need {remaining} more bytes")
                     return None, None
                 buffer.extend(chunk)
                 remaining -= len(chunk)
             except Exception:
-                print(f"⚠️  网络接收中断: 还需{remaining}字节")
+                print(f"⚠️  Wireless receive interrupted: need {remaining} more bytes")
                 return None, None
         
-        # 提取包数据
+        # Extract packet data
         packet_data = bytes(buffer[24:24+packet_length])
         
-        # 验证哈希
+        # Verify hash
         actual_hash = self.calculate_frame_hash(packet_data)
         if actual_hash != expected_hash:
-            print(f"⚠️  包{frame_id}哈希校验失败")
+            print(f"⚠️  Packet {frame_id} hash verification failed")
             self.stats['errors'] += 1
             return None, None
         
@@ -334,23 +370,23 @@ class WebPReceiver:
         return packet_data, packet_type
     
     def receiver_thread(self):
-        """接收线程"""
-        print("🚀 WebP接收线程启动")
+        """Receiver thread"""
+        print("🚀 WebP receiver thread started")
         
         while self.running:
             try:
                 packet_data, packet_type = self.receive_packet()
                 if packet_data and packet_type == PACKET_TYPE:
-                    # WebP解码
+                    # WebP decoding
                     frame = self.decode_frame_webp(packet_data)
                     if frame is not None:
-                        # 计算压缩比
+                        # Calculate compression ratio
                         original_size = frame.nbytes
                         compressed_size = len(packet_data)
                         compression_ratio = original_size / compressed_size
                         self.stats['compression_ratios'].append(compression_ratio)
                         
-                        # 非阻塞放入队列
+                        # Non-blocking put into queue
                         try:
                             self.received_frames.put_nowait(frame)
                         except queue.Full:
@@ -363,12 +399,12 @@ class WebPReceiver:
                     time.sleep(0.001)
                     
             except Exception as e:
-                print(f"❌ 接收线程错误: {e}")
+                print(f"❌ Receiver thread error: {e}")
                 time.sleep(0.01)
     
     def display_thread(self):
-        """显示线程"""
-        print("🚀 WebP显示线程启动")
+        """Display thread"""
+        print("🚀 WebP display thread started")
         
         try:
             if AUTO_RESIZE:
@@ -376,9 +412,9 @@ class WebPReceiver:
             else:
                 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
             
-            print(f"✅ OpenCV窗口创建成功: {WINDOW_NAME}")
+            print(f"✅ OpenCV window created successfully: {WINDOW_NAME}")
         except Exception as e:
-            print(f"❌ OpenCV窗口创建失败: {e}")
+            print(f"❌ OpenCV window creation failed: {e}")
             return
         
         last_fps_time = time.time()
@@ -389,19 +425,19 @@ class WebPReceiver:
                 frame = self.received_frames.get(timeout=0.5)
                 
                 if frame is not None:
-                    # 转换为彩色用于显示信息
+                    # Convert to color for displaying information
                     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
                     
-                    # 添加状态信息
+                    # Add status information
                     if SHOW_STATS:
                         self.add_status_overlay(frame_bgr)
                     
-                    # 显示
+                    # Display
                     cv2.imshow(WINDOW_NAME, frame_bgr)
                     self.stats['frames_displayed'] += 1
                     frame_count_for_fps += 1
                     
-                    # 计算显示帧率
+                    # Calculate display frame rate
                     current_time = time.time()
                     if current_time - last_fps_time >= 1.0:
                         fps = frame_count_for_fps / (current_time - last_fps_time)
@@ -417,13 +453,13 @@ class WebPReceiver:
                 self.show_no_signal()
                 continue
             except Exception as e:
-                print(f"❌ 显示线程错误: {e}")
+                print(f"❌ Display thread error: {e}")
                 time.sleep(0.1)
         
         cv2.destroyAllWindows()
     
     def add_status_overlay(self, frame):
-        """添加状态信息覆盖层"""
+        """Add status information overlay"""
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.4
         thickness = 1
@@ -432,15 +468,8 @@ class WebPReceiver:
         avg_packet_size = np.mean(list(self.stats['packet_sizes'])) if self.stats['packet_sizes'] else 0
         current_fps = np.mean(list(self.stats['fps_history'])[-3:]) if len(self.stats['fps_history']) >= 3 else 0
         
-        # 根据传输模式显示不同信息
-        if self.transmission_mode == 'uart':
-            port_info = f"Port: {RECEIVER_PORT}"
-        else:
-            port_info = f"Network: {NETWORK_HOST}:{NETWORK_PORT}"
-            
         info_lines = [
             f"Receiver: WebP",
-            port_info,
             f"Compression: {avg_compression:.1f}x",
             f"FPS: {current_fps:.1f}",
             f"Packet: {avg_packet_size:.0f}B",
@@ -449,40 +478,40 @@ class WebPReceiver:
             f"Errors: {self.stats['errors']}"
         ]
         
-        color = (0, 255, 0)  # 绿色
+        color = (0, 255, 0)  # Green
         
         for i, line in enumerate(info_lines):
             y = 15 + i * 15
             cv2.putText(frame, line, (5, y), font, font_scale, color, thickness)
     
     def show_no_signal(self):
-        """显示无信号状态"""
+        """Show no signal status"""
         no_signal = np.zeros((240, 320, 3), dtype=np.uint8)
         cv2.putText(no_signal, "NO SIGNAL", (80, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         
         if self.transmission_mode == 'uart':
-            wait_text = f"Waiting on {RECEIVER_PORT}"
+            wait_text = "Waiting for UART"
         else:
-            wait_text = f"Waiting on {NETWORK_HOST}:{NETWORK_PORT}"
+            wait_text = "Waiting for Wireless"
             
-        cv2.putText(no_signal, wait_text, (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(no_signal, wait_text, (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.imshow(WINDOW_NAME, no_signal)
         cv2.waitKey(100)
     
     def start(self):
-        """启动接收端"""
-        print("=== WebP视频接收端 ===")
-        print("🎯 接收端特性:")
-        print("- WebP解码显示")
-        print("- 智能缓冲防丢帧")
-        print("- 实时统计监控")
-        print("- 错误自动恢复")
+        """Start receiver"""
+        print("=== WebP Video Receiver ===")
+        print("🎯 Receiver features:")
+        print("- WebP decoding and display")
+        print("- Smart buffering to prevent frame loss")
+        print("- Real-time statistics monitoring")
+        print("- Automatic error recovery")
         print()
         if self.transmission_mode == 'uart':
-            print(f"📡 串口配置: {RECEIVER_PORT} @ {self.baud_rate}bps")
+            print(f"📡 Serial port configuration: {RECEIVER_PORT} @ {self.baud_rate}bps")
         else:
-            print(f"🌐 网络配置: {NETWORK_HOST}:{NETWORK_PORT} @ {self.baud_rate/1000}K bps (模拟UART)")
-        print(f"📺 显示配置: {WINDOW_NAME}")
+            print(f"🌐 Wireless configuration: {WIRELESS_HOST}:{WIRELESS_PORT} @ {self.baud_rate/1000}K bps")
+        print(f"📺 Display configuration: {WINDOW_NAME}")
         print()
         
         if not self.init_devices():
@@ -491,16 +520,16 @@ class WebPReceiver:
         self.running = True
         self.last_successful_time = time.time()
         
-        # 启动线程
+        # Start threads
         receiver = threading.Thread(target=self.receiver_thread, daemon=True)
         display = threading.Thread(target=self.display_thread, daemon=True)
         
         receiver.start()
         display.start()
         
-        print("✅ 所有线程已启动")
-        print("📺 WebP视频窗口应该已打开")
-        print("按 'q' 键或 Ctrl+C 退出")
+        print("✅ All threads started")
+        print("📺 WebP video window should be open")
+        print("Press 'q' key or Ctrl+C to exit")
         print()
         
         try:
@@ -508,46 +537,46 @@ class WebPReceiver:
                 time.sleep(5)
                 self.print_stats()
         except KeyboardInterrupt:
-            print("\n收到停止信号...")
+            print("\nReceived stop signal...")
         
         self.stop()
     
     def print_stats(self):
-        """打印统计信息"""
+        """Print statistics"""
         avg_compression = np.mean(list(self.stats['compression_ratios'])) if self.stats['compression_ratios'] else 1.0
         avg_packet_size = np.mean(list(self.stats['packet_sizes'])) if self.stats['packet_sizes'] else 0
         current_fps = np.mean(list(self.stats['fps_history'])[-5:]) if len(self.stats['fps_history']) >= 5 else 0
         
-        print(f"📊 接收统计 - 压缩比:{avg_compression:.1f}x 帧率:{current_fps:.1f}fps "
-              f"包大小:{avg_packet_size:.0f}B 接收:{self.stats['frames_received']} "
-              f"显示:{self.stats['frames_displayed']} 错误:{self.stats['errors']}")
+        print(f"📊 Receive statistics - Compression:{avg_compression:.1f}x FPS:{current_fps:.1f}fps "
+              f"Packet size:{avg_packet_size:.0f}B Received:{self.stats['frames_received']} "
+              f"Displayed:{self.stats['frames_displayed']} Errors:{self.stats['errors']}")
     
     def stop(self):
-        """停止接收端"""
-        print("🛑 停止WebP视频接收端...")
+        """Stop receiver"""
+        print("🛑 Stopping WebP video receiver...")
         self.running = False
         
-        # 根据传输模式清理连接
+        # Clean up connection according to transmission mode
         if self.transmission_mode == 'uart':
             if self.ser_receiver:
                 self.ser_receiver.close()
         else:
-            if self.network_socket:
+            if self.wireless_socket:
                 try:
-                    self.network_socket.close()
+                    self.wireless_socket.close()
                 except:
                     pass
         
         cv2.destroyAllWindows()
-        print("✅ 接收端已停止")
+        print("✅ Receiver stopped")
 
 def main():
-    """主函数"""
-    # 获取传输模式
+    """Main function"""
+    # Get transmission mode
     transmission_mode, baud_rate = select_transmission_mode()
     
-    print("启动WebP视频接收端")
-    print("使用方法: python webp_receiver.py")
+    print("Starting WebP video receiver")
+    print("Usage: python webp_receiver.py")
     print()
     
     receiver = WebPReceiver(transmission_mode=transmission_mode, baud_rate=baud_rate)
