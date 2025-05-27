@@ -1,11 +1,11 @@
 # WebP Video Transmission System
 
-A high-performance WebP video transmission system optimized for UART serial communication, supporting both wired UART and wireless transmission modes.
+A high-performance WebP video transmission system optimized for UART serial communication, supporting wired UART, wireless transmission, and hybrid modes.
 
 ## ✨ Features
 
 ### 🚀 Core Capabilities
-- **Dual Mode Support**: Wired UART (300K bps) and Wireless transmission (up to 5MHz)
+- **Triple Mode Support**: Wired UART (300K bps), Wireless transmission (up to 5MHz), and Hybrid mode
 - **Advanced Compression**: WebP encoding with compression ratios up to 104x
 - **Smart Optimization**: Dynamic quality adjustment and intelligent performance scaling
 - **Real-time Monitoring**: Live statistics display and frame rate monitoring
@@ -60,6 +60,7 @@ python webp_receiver.py
 When starting either program, you'll be prompted to select transmission mode:
 1. **Wired UART** (300,000 bps) - Traditional serial communication
 2. **Wireless transmission** - High-speed wireless mode with multiple speed options
+3. **Hybrid mode** - High-speed video with connection validation and reliability monitoring
 
 ## 📡 Transmission Modes
 
@@ -80,6 +81,13 @@ When starting either program, you'll be prompted to select transmission mode:
 - **2MHz (High Speed)**: Enhanced FPS and quality, ~30fps  
 - **5MHz (Ultra Speed)**: Maximum performance
 - **Custom**: User-defined speed (100K-10M bps)
+
+### Hybrid Mode
+- **Video Stream**: Transmitted over wireless network connection
+- **Handshaking**: Continuous 300kHz UART connection for validation
+- **Connection Requirements**: Both UART and wireless connections must be established
+- **Use Case**: High-speed video with connection validation and reliability monitoring
+- **Video Behavior**: Video only plays when UART handshaking is active, pauses when connection is lost
 
 ## ⚙️ Configuration
 
@@ -145,6 +153,12 @@ The system automatically adjusts video quality based on:
 - **Adaptive Windowing**: Dynamic time windows for different speeds
 - **Performance Scaling**: Automatic parameter optimization based on selected speed
 
+### Hybrid Mode Features
+- **Connection Validation**: Continuous UART handshaking at 300kHz
+- **Automatic Pause/Resume**: Video playback pauses when handshake connection is lost
+- **Status Monitoring**: Real-time display of handshake connection status
+- **Threshold Management**: Configurable timeout for handshake detection (default 500ms)
+
 ### Error Recovery
 - **Automatic Detection**: Monitors transmission health
 - **Recovery Mode**: Reduces quality/speed when errors detected
@@ -168,14 +182,14 @@ The receiver displays real-time information overlay:
 - Frames received/displayed
 - Error count
 
-## 🌐 Wireless Setup
+## 🌐 Wireless & Hybrid Setup
 
 ### Same Computer Testing
 1. Start sender: `python webp_sender.py`
-2. Select "2. Wireless transmission"
+2. Select "2. Wireless transmission" or "3. Hybrid mode"
 3. Choose speed (1MHz recommended for testing)
 4. Start receiver: `python webp_receiver.py`
-5. Select "2. Wireless transmission"
+5. Select matching mode (wireless or hybrid)
 6. Choose same speed as sender
 
 ### Two Computer Setup
@@ -188,6 +202,8 @@ The receiver displays real-time information overlay:
    - Run `python webp_receiver.py`
 
 3. **Firewall**: Ensure port 8888 is allowed through firewall
+
+4. **For Hybrid Mode**: Ensure both computers have UART connection established
 
 ## 🔍 Troubleshooting
 
@@ -219,13 +235,16 @@ The receiver displays real-time information overlay:
 - **FrameID**: Incrementing frame counter (4 bytes)
 - **Length**: Data payload length (4 bytes)  
 - **Type**: Packet type identifier (8 bytes)
+  - "WEBP" - Video frame data
+  - "HNDSHK" - Handshake packet (hybrid mode)
 - **Hash**: MD5 hash for verification (4 bytes)
-- **Data**: WebP encoded frame data
+- **Data**: WebP encoded frame data or handshake data
 
 ### Communication Flow
 1. **Sender**: Captures frame → WebP encode → Package → Transmit
 2. **Receiver**: Receive → Verify → WebP decode → Display
 3. **Flow Control**: Rate limiting based on selected transmission speed
+4. **Hybrid Mode**: Continuous handshake packets sent/received over UART at 300kHz
 
 ## 🧪 Development
 

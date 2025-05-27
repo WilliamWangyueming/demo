@@ -3,7 +3,7 @@
 """
 WebP Video Sender
 WebP video transmission program optimized for UART serial communication
-Supports both wired UART and wireless transmission modes
+Supports both wired UART, wireless transmission, and hybrid modes
 """
 
 import cv2
@@ -23,17 +23,58 @@ import select
 def select_transmission_mode():
     """Select transmission mode"""
     print("🔧 Please select transmission mode:")
-    print("1. Wired UART (300,000 bps)")
+    print("1. Wired UART (400,000 bps)")
     print("2. Wireless transmission (UART rate)")
+    print("3. Hybrid mode (Wireless video + UART handshaking)")
     
     while True:
-        choice = input("Please enter choice (1 or 2): ").strip()
+        choice = input("Please enter choice (1, 2, or 3): ").strip()
         if choice == '1':
             return 'uart', 400000
         elif choice == '2':
             return select_wireless_speed()
+        elif choice == '3':
+            return 'hybrid', 300000
         else:
-            print("❌ Invalid choice, please enter 1 or 2")
+            print("❌ Invalid choice, please enter 1, 2, or 3")
+
+def select_uart_speed():
+    """Select UART speed"""
+    print("\n🔌 Please select UART speed:")
+    print("1. 300K bps (Standard)")
+    print("2. 400K bps (Enhanced)")
+    print("3. 500K bps (High speed)")
+    print("4. 921.6K bps (Maximum)")
+    print("5. Custom speed")
+    
+    speed_options = {
+        '1': 300000,   # 300K
+        '2': 400000,   # 400K
+        '3': 500000,   # 500K
+        '4': 921600,   # 921.6K (maximum for most UART hardware)
+    }
+    
+    while True:
+        choice = input("Please enter choice (1-5): ").strip()
+        if choice in speed_options:
+            speed = speed_options[choice]
+            print(f"✅ Selected UART speed: {speed/1000:.1f}K bps")
+            return 'uart', speed
+        elif choice == '5':
+            try:
+                custom_speed = int(input("Please enter custom speed (bps, e.g. 460800): "))
+                if custom_speed < 9600:
+                    print("❌ Speed too low, minimum is 9,600 bps")
+                    continue
+                elif custom_speed > 3000000:
+                    print("❌ Speed too high, maximum is 3,000,000 bps")
+                    continue
+                print(f"✅ Custom UART speed: {custom_speed/1000:.1f}K bps")
+                return 'uart', custom_speed
+            except ValueError:
+                print("❌ Please enter a valid number")
+        else:
+            print("❌ Invalid choice, please enter 1-5")
 
 def select_wireless_speed():
     """Select wireless speed"""
@@ -178,6 +219,11 @@ class WebPSender:
         if self.transmission_mode == 'wireless':
             self.wireless_controller = WirelessUARTController(self.baud_rate)
         
+        # Hybrid mode
+        self.handshake_thread = None
+        self.handshake_running = False
+        self.handshake_counter = 0
+        
         # Camera
         self.cap = None
         
@@ -201,7 +247,8 @@ class WebPSender:
             'recoveries': 0,
             'compression_ratios': deque(maxlen=50),
             'packet_sizes': deque(maxlen=50),
-            'fps_history': deque(maxlen=30)
+            'fps_history': deque(maxlen=30),
+            'handshakes_sent': 0
         }
         
     def setup_performance_mode(self):
@@ -311,24 +358,76 @@ class WebPSender:
         # Initialize communication according to transmission mode
         if self.transmission_mode == 'uart':
             return self.init_uart()
-        else:
+        elif self.transmission_mode == 'wireless':
             return self.init_wireless()
+        else:  # hybrid mode
+            uart_success = self.init_uart()
+            wireless_success = self.init_wireless()
+            return uart_success and wireless_success
     
     def init_uart(self):
         """Initialize UART serial port"""
         try:
-            self.ser_sender = serial.Serial(SENDER_PORT, self.baud_rate, timeout=0.5)
+            # Optimize UART settings for higher performance
+            self.ser_sender = serial.Serial(
+                SENDER_PORT, 
+                self.baud_rate, 
+                timeout=0.5,
+                write_timeout=1.0,
+                # Disable software flow control for better throughput
+                xonxoff=False,
+                # Enable hardware flow control if your hardware supports it
+                rtscts=False,
+                dsrdtr=False
+            )
             
             # Clear buffers
             self.ser_sender.reset_input_buffer()
             self.ser_sender.reset_output_buffer()
             
             print(f"✅ Sender serial port initialization successful ({SENDER_PORT} @ {self.baud_rate}bps)")
+            
+            # Apply UART speed optimizations
+            self._apply_uart_speed_optimizations()
+            
             return True
         except Exception as e:
             print(f"❌ Sender serial port initialization failed: {e}")
             print(f"Please check if serial port {SENDER_PORT} is available")
             return False
+    
+    def _apply_uart_speed_optimizations(self):
+        """Apply optimizations based on UART speed"""
+        if self.transmission_mode != 'uart':
+            return
+            
+        # Calculate speed multiplier relative to baseline 300K
+        speed_multiplier = self.baud_rate / 300000
+        
+        if speed_multiplier > 1.0:
+            print(f"🚀 UART speed optimization: {speed_multiplier:.1f}x multiplier detected")
+            
+            # Adjust frame rate based on speed
+            if speed_multiplier >= 1.3:  # 400K+
+                # 提高帧率，降低延迟
+                target_fps = min(30, 15 * min(speed_multiplier, 2.0))
+                self.current_fps_delay = max(0.02, 1.0 / target_fps)
+                
+                # 降低初始质量以减小包大小
+                self.current_quality = min(60, int(self.current_quality * min(speed_multiplier, 1.2)))
+                
+                # 设置更合理的目标包大小
+                self.target_packet_size = int(1500 * min(speed_multiplier, 1.5))
+                
+                # Update description
+                improved_fps = 1.0 / self.current_fps_delay
+                base_description = self.mode_description
+                self.mode_description = f"{base_description} → UART optimized ({improved_fps:.0f}fps, Q{self.current_quality})"
+                
+                print(f"   FPS optimization: {15:.0f} → {improved_fps:.0f} fps")
+                print(f"   Quality optimization: Q{50} → Q{self.current_quality}")
+                print(f"   Packet size limit: {1261} → {self.target_packet_size}B")
+                print(f"   Delay setting: {self.current_fps_delay*1000:.1f}ms")
     
     def init_wireless(self):
         """Initialize wireless connection"""
@@ -400,14 +499,22 @@ class WebPSender:
             type_bytes = packet_type.ljust(8)[:8].encode('ascii')
             packet_hash = self.calculate_frame_hash(packet_data)
             
+            # Assemble the complete packet at once
             packet = magic + frame_id + length + type_bytes + packet_hash + packet_data
             
             # Send data according to transmission mode
             if self.transmission_mode == 'uart':
-                # UART mode
-                self.ser_sender.write(packet)
+                # UART mode - Send entire packet at once instead of byte by byte
+                # This is crucial for reducing TX blinking and improving efficiency
+                bytes_written = self.ser_sender.write(packet)
+                
+                # Only flush after complete packet
                 self.ser_sender.flush()
-            else:
+                
+                if bytes_written != len(packet):
+                    print(f"⚠️ Incomplete send: {bytes_written}/{len(packet)} bytes")
+                    return False
+            elif self.transmission_mode == 'wireless':
                 # Wireless mode - Control UART rate
                 if self.wireless_controller:
                     delay = self.wireless_controller.calculate_delay(len(packet))
@@ -415,6 +522,15 @@ class WebPSender:
                         time.sleep(delay)
                 
                 # Send data
+                self.client_socket.sendall(packet)
+            else:  # hybrid mode - send video data over wireless
+                # Control UART rate for wireless
+                if self.wireless_controller:
+                    delay = self.wireless_controller.calculate_delay(len(packet))
+                    if delay > 0:
+                        time.sleep(delay)
+                
+                # Send data over wireless
                 self.client_socket.sendall(packet)
             
             self.stats['frames_sent'] += 1
@@ -427,6 +543,50 @@ class WebPSender:
             self.stats['errors'] += 1
             self.error_count += 1
             return False
+    
+    def send_handshake_packet(self):
+        """Send handshake packet over UART in hybrid mode"""
+        try:
+            # Create a simple handshake packet
+            magic = PROTOCOL_MAGIC
+            handshake_id = struct.pack('<I', self.handshake_counter)
+            timestamp = struct.pack('<I', int(time.time() * 1000) % 1000000)
+            type_bytes = "HNDSHK".ljust(8)[:8].encode('ascii')
+            
+            # Simple payload with counter
+            payload = f"HANDSHAKE-{self.handshake_counter}".encode('ascii')
+            length = struct.pack('<I', len(payload))
+            packet_hash = self.calculate_frame_hash(payload)
+            
+            packet = magic + handshake_id + length + type_bytes + packet_hash + payload
+            
+            # Send handshake over UART
+            self.ser_sender.write(packet)
+            self.ser_sender.flush()
+            
+            self.handshake_counter += 1
+            self.stats['handshakes_sent'] += 1
+            
+            return True
+        except Exception as e:
+            print(f"❌ Handshake send failed: {e}")
+            return False
+    
+    def handshake_thread_func(self):
+        """Thread function for sending handshake packets at 300kHz in hybrid mode"""
+        print("🤝 Starting handshake thread at 300kHz")
+        
+        # Calculate timing for 300kHz handshaking
+        # At 300kHz, we need to send packets regularly to maintain the connection
+        handshake_interval = 0.01  # 10ms interval (100Hz)
+        
+        while self.handshake_running:
+            try:
+                self.send_handshake_packet()
+                time.sleep(handshake_interval)
+            except Exception as e:
+                print(f"❌ Handshake thread error: {e}")
+                time.sleep(0.1)
     
     def adjust_quality_smart(self):
         """Smart quality adjustment"""
@@ -445,8 +605,33 @@ class WebPSender:
             avg_compression = np.mean(list(self.stats['compression_ratios'])) if self.stats['compression_ratios'] else 1.0
             avg_packet_size = np.mean(list(self.stats['packet_sizes'])) if self.stats['packet_sizes'] else 2000
             
+            # UART模式专用优化策略
+            if self.transmission_mode == 'uart':
+                target_fps = 1.0 / self.current_fps_delay  # 目标帧率
+                
+                # 主要根据包大小调整质量，避免过度增加延迟
+                if avg_packet_size > self.target_packet_size * 1.5:
+                    # 包过大，降低质量但不增加延迟
+                    self.current_quality = max(20, self.current_quality - 3)
+                    print(f"📉 Reduce quality: Q{self.current_quality} (packet size too large)")
+                elif success_rate < 0.9:
+                    # 传输成功率低，轻微增加延迟
+                    self.current_quality = max(20, self.current_quality - 3)
+                    self.current_fps_delay = min(0.15, self.current_fps_delay * 1.05)
+                    print(f"📉 Reduce quality: Q{self.current_quality} (low success rate)")
+                elif avg_packet_size < self.target_packet_size * 0.7 and success_rate > 0.95:
+                    # 包较小且成功率高，可以提高质量或降低延迟
+                    if recent_fps < target_fps * 0.8:
+                        # 帧率不足，降低延迟
+                        self.current_fps_delay = max(0.02, self.current_fps_delay * 0.95)
+                        print(f"📈 Improve FPS: delay {self.current_fps_delay*1000:.1f}ms")
+                    else:
+                        # 帧率足够，提高质量
+                        self.current_quality = min(70, self.current_quality + 2)
+                        print(f"📈 Improve quality: Q{self.current_quality}")
+            
             # 🌐 Wireless mode smart adjustment strategy
-            if self.transmission_mode == 'wireless':
+            elif self.transmission_mode == 'wireless':
                 # Wireless mode: More relaxed packet size limits, more aggressive optimization
                 target_fps = 1.0 / self.current_fps_delay  # Target frame rate
                 
@@ -573,45 +758,31 @@ class WebPSender:
             print("✅ Exiting recovery mode")
     
     def start(self):
-        """Start sender"""
-        print("=== WebP Video Sender ===")
-        print("🎯 Sender features:")
-        print("- Performance configuration based on actual test data")
-        print("- Grayscale images reduce data by 67%")
-        print("- WebP compression ratio up to 104x")
-        print("- Smart dynamic quality adjustment")
-        print("- Real-time frame rate monitoring")
-        print()
-        if self.transmission_mode == 'uart':
-            print(f"📡 UART configuration: {SENDER_PORT} @ {self.baud_rate}bps")
-        else:
-            print(f"🌐 Wireless configuration: {WIRELESS_HOST}:{WIRELESS_PORT} @ {self.baud_rate/1000}K bps")
-        print(f"📹 Camera configuration: Index{CAMERA_INDEX}, {FRAME_WIDTH}x{FRAME_HEIGHT}")
-        print()
-        
+        """Start transmission"""
         if not self.init_devices():
-            return
+            print("❌ Device initialization failed")
+            return False
         
         self.running = True
-        self.last_successful_time = time.time()
         
         # Start sender thread
-        sender = threading.Thread(target=self.sender_thread, daemon=True)
-        sender.start()
+        self.sender_thread_obj = threading.Thread(target=self.sender_thread)
+        self.sender_thread_obj.daemon = True
+        self.sender_thread_obj.start()
         
-        print("✅ Sender thread started")
-        print("📡 Starting WebP video stream transmission...")
-        print("Press Ctrl+C to exit")
-        print()
+        # Start handshake thread for hybrid mode
+        if self.transmission_mode == 'hybrid':
+            self.handshake_running = True
+            self.handshake_thread = threading.Thread(target=self.handshake_thread_func)
+            self.handshake_thread.daemon = True
+            self.handshake_thread.start()
         
-        try:
-            while self.running:
-                time.sleep(5)
-                self.print_stats()
-        except KeyboardInterrupt:
-            print("\nReceived stop signal...")
+        print("🚀 WebP sender started successfully")
+        print("📊 Performance mode: " + self.mode_description)
+        print("📷 Camera resolution: " + str(FRAME_WIDTH) + "x" + str(FRAME_HEIGHT))
+        print("🔄 Transmission mode: " + self.transmission_mode.upper())
         
-        self.stop()
+        return True
     
     def print_stats(self):
         """Print statistics"""
@@ -626,50 +797,63 @@ class WebPSender:
               f"Success rate:{success_rate:.1%} Status:{'Recovery' if self.recovery_mode else 'Normal'}")
     
     def stop(self):
-        """Stop sender"""
-        print("🛑 Stopping WebP video sender...")
+        """Stop transmission"""
+        print("🛑 Stopping WebP sender...")
         self.running = False
         
-        if self.cap:
+        # Stop handshake thread for hybrid mode
+        if self.transmission_mode == 'hybrid' and self.handshake_running:
+            self.handshake_running = False
+            if self.handshake_thread:
+                self.handshake_thread.join(timeout=1.0)
+        
+        # Stop sender thread
+        if hasattr(self, 'sender_thread_obj') and self.sender_thread_obj.is_alive():
+            self.sender_thread_obj.join(timeout=1.0)
+        
+        # Release camera
+        if self.cap is not None:
             self.cap.release()
         
-        # Clean up connection according to transmission mode
-        if self.transmission_mode == 'uart':
-            if self.ser_sender:
-                self.ser_sender.close()
-        else:
-            try:
-                if hasattr(self, 'client_socket'):
-                    self.client_socket.close()
-                if self.wireless_socket:
-                    self.wireless_socket.close()
-            except:
-                pass
+        # Close serial port
+        if self.ser_sender is not None:
+            self.ser_sender.close()
         
-        print("✅ Sender stopped")
+        # Close wireless socket
+        if self.wireless_socket is not None:
+            self.wireless_socket.close()
+        
+        print("✅ WebP sender stopped successfully")
+        self.print_stats()
+        
+        return True
 
 def main():
     """Main function"""
-    import sys
+    print("=" * 60)
+    print("WebP Video Sender - UART/Wireless Optimized Video Transmission")
+    print("=" * 60)
     
-    # Get transmission mode
+    # Select transmission mode
     transmission_mode, baud_rate = select_transmission_mode()
     
-    # Support command line parameter selection of performance mode
-    performance_modes = ["high_fps", "balanced", "high_quality", "ultra_fast"]
+    # Create WebP sender
+    sender = WebPSender(transmission_mode=transmission_mode, baud_rate=baud_rate)
     
-    if len(sys.argv) > 1 and sys.argv[1] in performance_modes:
-        mode = sys.argv[1]
-    else:
-        mode = PERFORMANCE_MODE  # Use configured default mode
+    # Start transmission
+    if not sender.start():
+        print("❌ Transmission start failed")
+        return
     
-    print(f"Startup mode: {mode}")
-    print("Available modes: high_fps, balanced, high_quality, ultra_fast")
-    print("Usage: python webp_sender.py [mode]")
-    print()
-    
-    sender = WebPSender(performance_mode=mode, transmission_mode=transmission_mode, baud_rate=baud_rate)
-    sender.start()
+    # Wait for user to stop
+    try:
+        while True:
+            time.sleep(1)
+            sender.print_stats()
+    except KeyboardInterrupt:
+        print("\n🛑 User interrupted")
+    finally:
+        sender.stop()
 
 if __name__ == "__main__":
     main() 

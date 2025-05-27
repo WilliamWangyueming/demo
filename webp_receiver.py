@@ -3,7 +3,7 @@
 """
 WebP Video Receiver
 WebP video reception program optimized for UART serial communication
-Supports both wired UART and wireless transmission modes
+Supports both wired UART, wireless transmission, and hybrid modes
 """
 
 import cv2
@@ -23,17 +23,58 @@ import socket
 def select_transmission_mode():
     """Select transmission mode"""
     print("🔧 Please select transmission mode:")
-    print("1. Wired UART (300,000 bps)")
+    print("1. Wired UART (400,000 bps)")
     print("2. Wireless transmission (UART rate)")
+    print("3. Hybrid mode (Wireless video + UART handshaking)")
     
     while True:
-        choice = input("Please enter choice (1 or 2): ").strip()
+        choice = input("Please enter choice (1, 2, or 3): ").strip()
         if choice == '1':
             return 'uart', 400000
         elif choice == '2':
             return select_wireless_speed()
+        elif choice == '3':
+            return 'hybrid', 300000
         else:
-            print("❌ Invalid choice, please enter 1 or 2")
+            print("❌ Invalid choice, please enter 1, 2, or 3")
+
+def select_uart_speed():
+    """Select UART speed"""
+    print("\n🔌 Please select UART speed:")
+    print("1. 300K bps (Standard)")
+    print("2. 400K bps (Enhanced)")
+    print("3. 500K bps (High speed)")
+    print("4. 921.6K bps (Maximum)")
+    print("5. Custom speed")
+    
+    speed_options = {
+        '1': 300000,   # 300K
+        '2': 400000,   # 400K
+        '3': 500000,   # 500K
+        '4': 921600,   # 921.6K (maximum for most UART hardware)
+    }
+    
+    while True:
+        choice = input("Please enter choice (1-5): ").strip()
+        if choice in speed_options:
+            speed = speed_options[choice]
+            print(f"✅ Selected UART speed: {speed/1000:.1f}K bps")
+            return 'uart', speed
+        elif choice == '5':
+            try:
+                custom_speed = int(input("Please enter custom speed (bps, e.g. 460800): "))
+                if custom_speed < 9600:
+                    print("❌ Speed too low, minimum is 9,600 bps")
+                    continue
+                elif custom_speed > 3000000:
+                    print("❌ Speed too high, maximum is 3,000,000 bps")
+                    continue
+                print(f"✅ Custom UART speed: {custom_speed/1000:.1f}K bps")
+                return 'uart', custom_speed
+            except ValueError:
+                print("❌ Please enter a valid number")
+        else:
+            print("❌ Invalid choice, please enter 1-5")
 
 def select_wireless_speed():
     """Select wireless speed"""
@@ -112,6 +153,14 @@ class WebPReceiver:
         # Wireless (wireless mode)
         self.wireless_socket = None
         
+        # Hybrid mode
+        self.handshake_thread = None
+        self.handshake_running = False
+        self.last_handshake_time = 0
+        self.handshake_timeout = 0.5  # 500ms timeout for handshakes
+        self.handshake_active = False
+        self.handshake_counter = 0
+        
         # Smart buffering
         self.received_frames = queue.Queue(maxsize=FRAME_BUFFER_SIZE)
         
@@ -127,7 +176,8 @@ class WebPReceiver:
             'errors': 0,
             'compression_ratios': deque(maxlen=STATS_BUFFER_SIZE),
             'packet_sizes': deque(maxlen=STATS_BUFFER_SIZE),
-            'fps_history': deque(maxlen=30)
+            'fps_history': deque(maxlen=30),
+            'handshakes_received': 0
         }
         
     def init_devices(self):
@@ -143,19 +193,34 @@ class WebPReceiver:
         # Initialize communication according to transmission mode
         if self.transmission_mode == 'uart':
             return self.init_uart()
-        else:
+        elif self.transmission_mode == 'wireless':
             return self.init_wireless()
+        else:  # hybrid mode
+            uart_success = self.init_uart()
+            wireless_success = self.init_wireless()
+            return uart_success and wireless_success
     
     def init_uart(self):
         """Initialize UART serial port"""
         try:
-            self.ser_receiver = serial.Serial(RECEIVER_PORT, self.baud_rate, timeout=RECEIVE_TIMEOUT)
+            # Optimize UART settings for higher performance
+            self.ser_receiver = serial.Serial(
+                RECEIVER_PORT, 
+                self.baud_rate, 
+                timeout=RECEIVE_TIMEOUT,
+                # Disable software flow control for better throughput
+                xonxoff=False,
+                # Enable hardware flow control if your hardware supports it
+                rtscts=False,
+                dsrdtr=False
+            )
             
             # Clear buffers
             self.ser_receiver.reset_input_buffer()
             self.ser_receiver.reset_output_buffer()
             
             print(f"✅ Receiver serial port initialization successful ({RECEIVER_PORT} @ {self.baud_rate}bps)")
+            
             return True
         except Exception as e:
             print(f"❌ Receiver serial port initialization failed: {e}")
@@ -221,72 +286,95 @@ class WebPReceiver:
     
     def receive_packet_uart(self):
         """UART method to receive data packet"""
-        # Find magic number
-        buffer = bytearray()
-        magic_found = False
-        
-        start_time = time.time()
-        while not magic_found and (time.time() - start_time) < 0.1:
-            byte = self.ser_receiver.read(1)
-            if not byte:
-                break
-                
-            buffer.extend(byte)
+        try:
+            # Find magic number with optimized reading strategy
+            buffer = bytearray()
+            magic_found = False
             
-            if len(buffer) >= 4:
-                magic_pos = buffer.find(PROTOCOL_MAGIC)
-                if magic_pos != -1:
-                    buffer = buffer[magic_pos:]
-                    magic_found = True
-        
-        if not magic_found:
-            return None, None
-        
-        # Ensure complete header (4+4+4+8+4=24)
-        while len(buffer) < 24:
-            byte = self.ser_receiver.read(1)
-            if not byte:
+            # First try to read a larger chunk to reduce individual reads
+            initial_chunk = self.ser_receiver.read(min(256, max(64, self.ser_receiver.in_waiting)))
+            if not initial_chunk:
                 return None, None
-            buffer.extend(byte)
-        
-        # Parse header
-        frame_id = struct.unpack('<I', buffer[4:8])[0]
-        packet_length = struct.unpack('<I', buffer[8:12])[0]
-        packet_type = buffer[12:20].decode('ascii').strip()
-        expected_hash = buffer[20:24]
-        
-        # Verify packet length
-        if packet_length > 10000 or packet_length < 50:
-            print(f"⚠️  Abnormal packet length: {packet_length}")
-            return None, None
-        
-        # Read remaining data
-        remaining = packet_length - (len(buffer) - 24)
-        while remaining > 0:
-            chunk = self.ser_receiver.read(min(remaining, 1024))
-            if not chunk:
-                print(f"⚠️  Incomplete data: need {remaining} more bytes")
+                
+            buffer.extend(initial_chunk)
+            
+            # Look for magic number in the initial chunk
+            magic_pos = buffer.find(PROTOCOL_MAGIC)
+            if magic_pos != -1:
+                buffer = buffer[magic_pos:]
+                magic_found = True
+            
+            # If not found, continue with smaller reads
+            start_time = time.time()
+            while not magic_found and (time.time() - start_time) < 0.1:
+                # Read multiple bytes at once instead of byte-by-byte
+                chunk = self.ser_receiver.read(64)
+                if not chunk:
+                    break
+                    
+                buffer.extend(chunk)
+                
+                if len(buffer) >= 4:
+                    magic_pos = buffer.find(PROTOCOL_MAGIC)
+                    if magic_pos != -1:
+                        buffer = buffer[magic_pos:]
+                        magic_found = True
+            
+            if not magic_found:
                 return None, None
-            buffer.extend(chunk)
-            remaining -= len(chunk)
-        
-        # Extract packet data
-        packet_data = bytes(buffer[24:24+packet_length])
-        
-        # Verify hash
-        actual_hash = self.calculate_frame_hash(packet_data)
-        if actual_hash != expected_hash:
-            print(f"⚠️  Packet {frame_id} hash verification failed")
+            
+            # Ensure complete header (4+4+4+8+4=24)
+            while len(buffer) < 24:
+                # Read the remaining header bytes at once
+                remaining_header = 24 - len(buffer)
+                chunk = self.ser_receiver.read(remaining_header)
+                if not chunk:
+                    return None, None
+                buffer.extend(chunk)
+            
+            # Parse header
+            frame_id = struct.unpack('<I', buffer[4:8])[0]
+            packet_length = struct.unpack('<I', buffer[8:12])[0]
+            packet_type = buffer[12:20].decode('ascii').strip()
+            expected_hash = buffer[20:24]
+            
+            # Verify packet length
+            if packet_length > 10000 or packet_length < 50:
+                print(f"⚠️  Abnormal packet length: {packet_length}")
+                return None, None
+            
+            # Read remaining data - optimize by reading larger chunks
+            remaining = packet_length - (len(buffer) - 24)
+            
+            # Try to read all remaining data at once if possible
+            if remaining > 0:
+                data_chunk = self.ser_receiver.read(remaining)
+                if len(data_chunk) != remaining:
+                    print(f"⚠️  Incomplete data: received {len(data_chunk)} of {remaining} bytes")
+                    return None, None
+                buffer.extend(data_chunk)
+            
+            # Extract packet data
+            packet_data = bytes(buffer[24:24+packet_length])
+            
+            # Verify hash
+            actual_hash = self.calculate_frame_hash(packet_data)
+            if actual_hash != expected_hash:
+                print(f"⚠️  Packet {frame_id} hash verification failed")
+                self.stats['errors'] += 1
+                return None, None
+            
+            self.stats['frames_received'] += 1
+            self.stats['bytes_received'] += len(packet_data)
+            self.stats['packet_sizes'].append(len(packet_data))
+            self.last_successful_time = time.time()
+            self.error_count = 0
+            
+            return packet_data, packet_type
+        except Exception as e:
+            print(f"❌ UART receive error: {e}")
             self.stats['errors'] += 1
             return None, None
-        
-        self.stats['frames_received'] += 1
-        self.stats['bytes_received'] += len(packet_data)
-        self.stats['packet_sizes'].append(len(packet_data))
-        self.last_successful_time = time.time()
-        self.error_count = 0
-        
-        return packet_data, packet_type
     
     def receive_packet_wireless(self):
         """Wireless method to receive data packet"""
@@ -369,6 +457,123 @@ class WebPReceiver:
         
         return packet_data, packet_type
     
+    def receive_handshake_packet(self):
+        """Receive handshake packet over UART in hybrid mode"""
+        try:
+            # Find magic number with optimized reading strategy
+            buffer = bytearray()
+            magic_found = False
+            
+            # First try to read a larger chunk
+            initial_chunk = self.ser_receiver.read(min(64, max(32, self.ser_receiver.in_waiting)))
+            if not initial_chunk:
+                return False
+                
+            buffer.extend(initial_chunk)
+            
+            # Look for magic number in the initial chunk
+            magic_pos = buffer.find(PROTOCOL_MAGIC)
+            if magic_pos != -1:
+                buffer = buffer[magic_pos:]
+                magic_found = True
+            
+            # If not found, continue with smaller reads
+            start_time = time.time()
+            while not magic_found and (time.time() - start_time) < 0.1:
+                # Read multiple bytes at once
+                chunk = self.ser_receiver.read(32)
+                if not chunk:
+                    break
+                    
+                buffer.extend(chunk)
+                
+                if len(buffer) >= 4:
+                    magic_pos = buffer.find(PROTOCOL_MAGIC)
+                    if magic_pos != -1:
+                        buffer = buffer[magic_pos:]
+                        magic_found = True
+            
+            if not magic_found:
+                return False
+            
+            # Ensure complete header (4+4+4+8+4=24)
+            while len(buffer) < 24:
+                # Read the remaining header bytes at once
+                remaining_header = 24 - len(buffer)
+                chunk = self.ser_receiver.read(remaining_header)
+                if not chunk:
+                    return False
+                buffer.extend(chunk)
+            
+            # Parse header
+            handshake_id = struct.unpack('<I', buffer[4:8])[0]
+            packet_length = struct.unpack('<I', buffer[8:12])[0]
+            packet_type = buffer[12:20].decode('ascii').strip()
+            expected_hash = buffer[20:24]
+            
+            # Verify it's a handshake packet
+            if packet_type != "HNDSHK":
+                return False
+            
+            # Verify packet length
+            if packet_length > 1000 or packet_length < 5:
+                print(f"⚠️  Abnormal handshake packet length: {packet_length}")
+                return False
+            
+            # Read remaining data - optimize by reading all at once
+            remaining = packet_length - (len(buffer) - 24)
+            if remaining > 0:
+                data_chunk = self.ser_receiver.read(remaining)
+                if len(data_chunk) != remaining:
+                    return False
+                buffer.extend(data_chunk)
+            
+            # Extract packet data
+            packet_data = bytes(buffer[24:24+packet_length])
+            
+            # Verify hash
+            actual_hash = self.calculate_frame_hash(packet_data)
+            if actual_hash != expected_hash:
+                print(f"⚠️  Handshake {handshake_id} hash verification failed")
+                return False
+            
+            # Update handshake status
+            self.last_handshake_time = time.time()
+            self.handshake_active = True
+            self.handshake_counter = handshake_id
+            self.stats['handshakes_received'] += 1
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Handshake receive error: {e}")
+            return False
+
+    def handshake_thread_func(self):
+        """Thread function for receiving handshake packets in hybrid mode"""
+        print("🤝 Starting handshake monitoring thread")
+        
+        while self.handshake_running:
+            try:
+                # Try to receive a handshake packet
+                if self.receive_handshake_packet():
+                    # Successfully received handshake
+                    if not self.handshake_active:
+                        print("✅ Handshake connection established")
+                        self.handshake_active = True
+                else:
+                    # Check if handshake timed out
+                    if self.handshake_active and (time.time() - self.last_handshake_time) > self.handshake_timeout:
+                        print("⚠️  Handshake connection lost")
+                        self.handshake_active = False
+                
+                # Short sleep to prevent CPU overload
+                time.sleep(0.001)
+                
+            except Exception as e:
+                print(f"❌ Handshake thread error: {e}")
+                time.sleep(0.1)
+
     def receiver_thread(self):
         """Receiver thread"""
         print("🚀 WebP receiver thread started")
@@ -422,6 +627,12 @@ class WebPReceiver:
         
         while self.running:
             try:
+                # In hybrid mode, only display if handshake is active
+                if self.transmission_mode == 'hybrid' and not self.handshake_active:
+                    self.show_no_signal("HANDSHAKE LOST")
+                    time.sleep(0.1)
+                    continue
+                
                 frame = self.received_frames.get(timeout=0.5)
                 
                 if frame is not None:
@@ -478,68 +689,72 @@ class WebPReceiver:
             f"Errors: {self.stats['errors']}"
         ]
         
+        # Add handshake info for hybrid mode
+        if self.transmission_mode == 'hybrid':
+            handshake_status = "ACTIVE" if self.handshake_active else "INACTIVE"
+            handshake_color = (0, 255, 0) if self.handshake_active else (0, 0, 255)
+            info_lines.append(f"Handshakes: {self.stats['handshakes_received']}")
+            info_lines.append(f"Status: {handshake_status}")
+            
+            # Draw handshake status indicator
+            cv2.putText(frame, handshake_status, (frame.shape[1] - 80, 15), 
+                       font, font_scale, handshake_color, thickness)
+        
         color = (0, 255, 0)  # Green
         
         for i, line in enumerate(info_lines):
             y = 15 + i * 15
             cv2.putText(frame, line, (5, y), font, font_scale, color, thickness)
     
-    def show_no_signal(self):
+    def show_no_signal(self, message=None):
         """Show no signal status"""
         no_signal = np.zeros((240, 320, 3), dtype=np.uint8)
         cv2.putText(no_signal, "NO SIGNAL", (80, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         
-        if self.transmission_mode == 'uart':
+        if message:
+            cv2.putText(no_signal, message, (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        elif self.transmission_mode == 'uart':
             wait_text = "Waiting for UART"
-        else:
+            cv2.putText(no_signal, wait_text, (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        elif self.transmission_mode == 'wireless':
             wait_text = "Waiting for Wireless"
+            cv2.putText(no_signal, wait_text, (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        else:  # hybrid mode
+            wait_text = "Waiting for Hybrid Connection"
+            cv2.putText(no_signal, wait_text, (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
-        cv2.putText(no_signal, wait_text, (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.imshow(WINDOW_NAME, no_signal)
         cv2.waitKey(100)
     
     def start(self):
-        """Start receiver"""
-        print("=== WebP Video Receiver ===")
-        print("🎯 Receiver features:")
-        print("- WebP decoding and display")
-        print("- Smart buffering to prevent frame loss")
-        print("- Real-time statistics monitoring")
-        print("- Automatic error recovery")
-        print()
-        if self.transmission_mode == 'uart':
-            print(f"📡 Serial port configuration: {RECEIVER_PORT} @ {self.baud_rate}bps")
-        else:
-            print(f"🌐 Wireless configuration: {WIRELESS_HOST}:{WIRELESS_PORT} @ {self.baud_rate/1000}K bps")
-        print(f"📺 Display configuration: {WINDOW_NAME}")
-        print()
-        
+        """Start reception"""
         if not self.init_devices():
-            return
+            print("❌ Device initialization failed")
+            return False
         
         self.running = True
-        self.last_successful_time = time.time()
         
-        # Start threads
-        receiver = threading.Thread(target=self.receiver_thread, daemon=True)
-        display = threading.Thread(target=self.display_thread, daemon=True)
+        # Start receiver thread
+        self.receiver_thread_obj = threading.Thread(target=self.receiver_thread)
+        self.receiver_thread_obj.daemon = True
+        self.receiver_thread_obj.start()
         
-        receiver.start()
-        display.start()
+        # Start handshake thread for hybrid mode
+        if self.transmission_mode == 'hybrid':
+            self.handshake_running = True
+            self.handshake_thread = threading.Thread(target=self.handshake_thread_func)
+            self.handshake_thread.daemon = True
+            self.handshake_thread.start()
         
-        print("✅ All threads started")
-        print("📺 WebP video window should be open")
-        print("Press 'q' key or Ctrl+C to exit")
-        print()
+        # Start display thread
+        self.display_thread_obj = threading.Thread(target=self.display_thread)
+        self.display_thread_obj.daemon = True
+        self.display_thread_obj.start()
         
-        try:
-            while self.running:
-                time.sleep(5)
-                self.print_stats()
-        except KeyboardInterrupt:
-            print("\nReceived stop signal...")
+        print("🚀 WebP receiver started successfully")
+        print("🔄 Transmission mode: " + self.transmission_mode.upper())
         
-        self.stop()
+        return True
     
     def print_stats(self):
         """Print statistics"""
@@ -552,35 +767,62 @@ class WebPReceiver:
               f"Displayed:{self.stats['frames_displayed']} Errors:{self.stats['errors']}")
     
     def stop(self):
-        """Stop receiver"""
-        print("🛑 Stopping WebP video receiver...")
+        """Stop reception"""
+        print("🛑 Stopping WebP receiver...")
         self.running = False
         
-        # Clean up connection according to transmission mode
-        if self.transmission_mode == 'uart':
-            if self.ser_receiver:
-                self.ser_receiver.close()
-        else:
-            if self.wireless_socket:
-                try:
-                    self.wireless_socket.close()
-                except:
-                    pass
+        # Stop handshake thread for hybrid mode
+        if self.transmission_mode == 'hybrid' and self.handshake_running:
+            self.handshake_running = False
+            if self.handshake_thread:
+                self.handshake_thread.join(timeout=1.0)
         
-        cv2.destroyAllWindows()
-        print("✅ Receiver stopped")
+        # Stop threads
+        if hasattr(self, 'receiver_thread_obj') and self.receiver_thread_obj.is_alive():
+            self.receiver_thread_obj.join(timeout=1.0)
+        
+        if hasattr(self, 'display_thread_obj') and self.display_thread_obj.is_alive():
+            self.display_thread_obj.join(timeout=1.0)
+        
+        # Close serial port
+        if self.ser_receiver is not None:
+            self.ser_receiver.close()
+        
+        # Close wireless socket
+        if self.wireless_socket is not None:
+            self.wireless_socket.close()
+        
+        print("✅ WebP receiver stopped successfully")
+        self.print_stats()
+        
+        return True
 
 def main():
     """Main function"""
-    # Get transmission mode
+    print("=" * 60)
+    print("WebP Video Receiver - UART/Wireless Optimized Video Reception")
+    print("=" * 60)
+    
+    # Select transmission mode
     transmission_mode, baud_rate = select_transmission_mode()
     
-    print("Starting WebP video receiver")
-    print("Usage: python webp_receiver.py")
-    print()
-    
+    # Create WebP receiver
     receiver = WebPReceiver(transmission_mode=transmission_mode, baud_rate=baud_rate)
-    receiver.start()
+    
+    # Start reception
+    if not receiver.start():
+        print("❌ Reception start failed")
+        return
+    
+    # Wait for user to stop
+    try:
+        while True:
+            time.sleep(1)
+            receiver.print_stats()
+    except KeyboardInterrupt:
+        print("\n🛑 User interrupted")
+    finally:
+        receiver.stop()
 
 if __name__ == "__main__":
     main() 
