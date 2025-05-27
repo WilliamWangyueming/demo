@@ -34,47 +34,9 @@ def select_transmission_mode():
         elif choice == '2':
             return select_wireless_speed()
         elif choice == '3':
-            return 'hybrid', 300000
+            return 'hybrid', 400000
         else:
             print("❌ Invalid choice, please enter 1, 2, or 3")
-
-def select_uart_speed():
-    """Select UART speed"""
-    print("\n🔌 Please select UART speed:")
-    print("1. 300K bps (Standard)")
-    print("2. 400K bps (Enhanced)")
-    print("3. 500K bps (High speed)")
-    print("4. 921.6K bps (Maximum)")
-    print("5. Custom speed")
-    
-    speed_options = {
-        '1': 300000,   # 300K
-        '2': 400000,   # 400K
-        '3': 500000,   # 500K
-        '4': 921600,   # 921.6K (maximum for most UART hardware)
-    }
-    
-    while True:
-        choice = input("Please enter choice (1-5): ").strip()
-        if choice in speed_options:
-            speed = speed_options[choice]
-            print(f"✅ Selected UART speed: {speed/1000:.1f}K bps")
-            return 'uart', speed
-        elif choice == '5':
-            try:
-                custom_speed = int(input("Please enter custom speed (bps, e.g. 460800): "))
-                if custom_speed < 9600:
-                    print("❌ Speed too low, minimum is 9,600 bps")
-                    continue
-                elif custom_speed > 3000000:
-                    print("❌ Speed too high, maximum is 3,000,000 bps")
-                    continue
-                print(f"✅ Custom UART speed: {custom_speed/1000:.1f}K bps")
-                return 'uart', custom_speed
-            except ValueError:
-                print("❌ Please enter a valid number")
-        else:
-            print("❌ Invalid choice, please enter 1-5")
 
 def select_wireless_speed():
     """Select wireless speed"""
@@ -133,8 +95,11 @@ FRAME_HEIGHT = 240          # Frame height
 PERFORMANCE_MODE = "balanced"
 
 # Advanced configuration (generally no need to modify)
-PROTOCOL_MAGIC = b'WEBP'    # Protocol magic number
+PROTOCOL_MAGIC = b'WP'      # 缩短魔术字节为2字节
 PACKET_TYPE = "WEBP"        # Packet type
+
+# 优化协议设置
+USE_SIMPLIFIED_PROTOCOL = True  # 使用简化协议以减少开销
 # ================================================
 
 class WirelessUARTController:
@@ -223,6 +188,8 @@ class WebPSender:
         self.handshake_thread = None
         self.handshake_running = False
         self.handshake_counter = 0
+        self.handshake_interval = 0.05  # 设置为50ms，提供适中的频率
+        self.handshake_buffer = bytearray()  # 用于存储预生成的握手包
         
         # Camera
         self.cap = None
@@ -390,6 +357,10 @@ class WebPSender:
             # Apply UART speed optimizations
             self._apply_uart_speed_optimizations()
             
+            # 如果是hybrid模式，预生成一些握手包
+            if self.transmission_mode == 'hybrid':
+                self._prepare_handshake_packets()
+            
             return True
         except Exception as e:
             print(f"❌ Sender serial port initialization failed: {e}")
@@ -428,6 +399,34 @@ class WebPSender:
                 print(f"   Quality optimization: Q{50} → Q{self.current_quality}")
                 print(f"   Packet size limit: {1261} → {self.target_packet_size}B")
                 print(f"   Delay setting: {self.current_fps_delay*1000:.1f}ms")
+    
+    def _prepare_handshake_packets(self):
+        """预生成握手包，提高发送效率"""
+        if self.transmission_mode != 'hybrid':
+            return
+            
+        print("🤝 Preparing handshake packets...")
+        
+        # 预生成10个握手包
+        for i in range(10):
+            if USE_SIMPLIFIED_PROTOCOL:
+                magic = PROTOCOL_MAGIC
+                hs_marker = b'HS'
+                counter = struct.pack('<H', i % 65536)
+                packet = magic + hs_marker + counter
+            else:
+                magic = PROTOCOL_MAGIC
+                handshake_id = struct.pack('<I', i)
+                timestamp = struct.pack('<I', int(time.time() * 1000) % 1000000)
+                type_bytes = "HNDSHK".ljust(8)[:8].encode('ascii')
+                payload = f"HANDSHAKE-{i}".encode('ascii')
+                length = struct.pack('<I', len(payload))
+                packet_hash = self.calculate_frame_hash(payload)
+                packet = magic + handshake_id + length + type_bytes + packet_hash + payload
+                
+            self.handshake_buffer += packet
+        
+        print(f"✅ Prepared {len(self.handshake_buffer)} bytes of handshake data")
     
     def init_wireless(self):
         """Initialize wireless connection"""
@@ -487,20 +486,41 @@ class WebPSender:
     
     def calculate_frame_hash(self, frame_data):
         """Calculate frame data hash for verification"""
-        return hashlib.md5(frame_data).digest()[:4]
+        if USE_SIMPLIFIED_PROTOCOL:
+            # 使用简单的校验和代替MD5哈希，减少计算开销
+            checksum = 0
+            # 每1024字节采样一次以加快计算速度
+            for i in range(0, len(frame_data), 1024):
+                chunk = frame_data[i:i+1024]
+                checksum = (checksum + sum(chunk)) & 0xFFFFFFFF
+            return struct.pack('<I', checksum)
+        else:
+            # 原始MD5哈希方法
+            return hashlib.md5(frame_data).digest()[:4]
     
     def send_packet(self, packet_data, packet_type=PACKET_TYPE):
         """Send data packet"""
         try:
-            # Protocol: Magic(4) + FrameID(4) + Length(4) + Type(8) + Hash(4) + Data
-            magic = PROTOCOL_MAGIC
-            frame_id = struct.pack('<I', self.frame_counter)
-            length = struct.pack('<I', len(packet_data))
-            type_bytes = packet_type.ljust(8)[:8].encode('ascii')
-            packet_hash = self.calculate_frame_hash(packet_data)
-            
-            # Assemble the complete packet at once
-            packet = magic + frame_id + length + type_bytes + packet_hash + packet_data
+            if USE_SIMPLIFIED_PROTOCOL:
+                # 简化的协议头: Magic(2) + Length(2) + Hash(4) + Data
+                # 总共减少了10字节的头部开销
+                magic = PROTOCOL_MAGIC
+                # 使用2字节表示长度，最大支持65535字节
+                length = struct.pack('<H', len(packet_data))
+                packet_hash = self.calculate_frame_hash(packet_data)
+                
+                # 组装简化的数据包
+                packet = magic + length + packet_hash + packet_data
+            else:
+                # 原始协议: Magic(4) + FrameID(4) + Length(4) + Type(8) + Hash(4) + Data
+                magic = PROTOCOL_MAGIC
+                frame_id = struct.pack('<I', self.frame_counter)
+                length = struct.pack('<I', len(packet_data))
+                type_bytes = packet_type.ljust(8)[:8].encode('ascii')
+                packet_hash = self.calculate_frame_hash(packet_data)
+                
+                # 组装完整的数据包
+                packet = magic + frame_id + length + type_bytes + packet_hash + packet_data
             
             # Send data according to transmission mode
             if self.transmission_mode == 'uart':
@@ -547,46 +567,104 @@ class WebPSender:
     def send_handshake_packet(self):
         """Send handshake packet over UART in hybrid mode"""
         try:
-            # Create a simple handshake packet
-            magic = PROTOCOL_MAGIC
-            handshake_id = struct.pack('<I', self.handshake_counter)
-            timestamp = struct.pack('<I', int(time.time() * 1000) % 1000000)
-            type_bytes = "HNDSHK".ljust(8)[:8].encode('ascii')
+            # 使用预生成的握手包或生成新的
+            if len(self.handshake_buffer) > 0 and self.handshake_counter % 10 < 5:
+                # 使用预生成的握手包，每10次使用5次
+                packet_index = self.handshake_counter % 10
+                if USE_SIMPLIFIED_PROTOCOL:
+                    packet_size = 6  # Magic(2) + 'HS'(2) + Counter(2)
+                else:
+                    # 计算原始协议的包大小
+                    packet_size = 24 + len(f"HANDSHAKE-{packet_index}".encode('ascii'))
+                
+                packet = self.handshake_buffer[packet_index * packet_size:(packet_index + 1) * packet_size]
+            else:
+                # 生成新的握手包
+                if USE_SIMPLIFIED_PROTOCOL:
+                    # 简化协议: Magic(2) + 'HS'(2) + Counter(2)
+                    magic = PROTOCOL_MAGIC
+                    hs_marker = b'HS'
+                    counter = struct.pack('<H', self.handshake_counter % 65536)
+                    packet = magic + hs_marker + counter
+                else:
+                    # 原始握手包格式
+                    magic = PROTOCOL_MAGIC
+                    handshake_id = struct.pack('<I', self.handshake_counter)
+                    timestamp = struct.pack('<I', int(time.time() * 1000) % 1000000)
+                    type_bytes = "HNDSHK".ljust(8)[:8].encode('ascii')
+                    
+                    # Simple payload with counter
+                    payload = f"HANDSHAKE-{self.handshake_counter}".encode('ascii')
+                    length = struct.pack('<I', len(payload))
+                    packet_hash = self.calculate_frame_hash(payload)
+                    
+                    packet = magic + handshake_id + length + type_bytes + packet_hash + payload
             
-            # Simple payload with counter
-            payload = f"HANDSHAKE-{self.handshake_counter}".encode('ascii')
-            length = struct.pack('<I', len(payload))
-            packet_hash = self.calculate_frame_hash(payload)
-            
-            packet = magic + handshake_id + length + type_bytes + packet_hash + payload
-            
-            # Send handshake over UART
-            self.ser_sender.write(packet)
-            self.ser_sender.flush()
-            
-            self.handshake_counter += 1
-            self.stats['handshakes_sent'] += 1
-            
-            return True
+            # 发送前确保串口可用
+            if self.ser_sender and self.ser_sender.is_open:
+                # 使用写入优先级
+                self.ser_sender.write(packet)
+                self.ser_sender.flush()
+                
+                self.handshake_counter += 1
+                self.stats['handshakes_sent'] += 1
+                return True
+            return False
         except Exception as e:
             print(f"❌ Handshake send failed: {e}")
             return False
     
     def handshake_thread_func(self):
-        """Thread function for sending handshake packets at 300kHz in hybrid mode"""
-        print("🤝 Starting handshake thread at 300kHz")
+        """Thread function for sending handshake packets at regular intervals in hybrid mode"""
+        print(f"🤝 Starting handshake thread with {self.handshake_interval*1000:.1f}ms interval")
         
-        # Calculate timing for 300kHz handshaking
-        # At 300kHz, we need to send packets regularly to maintain the connection
-        handshake_interval = 0.01  # 10ms interval (100Hz)
+        # 使用更稳定的计时方法
+        next_time = time.time()
+        
+        # 错误计数和恢复机制
+        error_count = 0
+        last_success_time = time.time()
+        
+        # 动态调整发送间隔
+        dynamic_interval = self.handshake_interval
+        min_interval = 0.03  # 最小30ms
+        max_interval = 0.1   # 最大100ms
         
         while self.handshake_running:
             try:
-                self.send_handshake_packet()
-                time.sleep(handshake_interval)
+                current_time = time.time()
+                if current_time >= next_time:
+                    if self.send_handshake_packet():
+                        error_count = 0
+                        last_success_time = current_time
+                        
+                        # 成功发送后，可以适当增加间隔，减少带宽占用
+                        if dynamic_interval < self.handshake_interval:
+                            dynamic_interval = min(self.handshake_interval, dynamic_interval * 1.1)
+                    else:
+                        error_count += 1
+                        # 发送失败时，减少间隔，增加尝试频率
+                        dynamic_interval = max(min_interval, dynamic_interval * 0.8)
+                        
+                        # 如果连续失败超过5次，尝试重置串口
+                        if error_count > 5 and (current_time - last_success_time) > 1.0:
+                            print("⚠️ Handshake sending failed multiple times, attempting recovery...")
+                            try:
+                                if self.ser_sender and self.ser_sender.is_open:
+                                    self.ser_sender.reset_output_buffer()
+                            except:
+                                pass
+                            error_count = 0
+                    
+                    # 计算下一次发送时间，使用动态间隔
+                    next_time = current_time + dynamic_interval
+                else:
+                    # 短暂休眠，避免CPU占用过高
+                    sleep_time = min(0.001, (next_time - current_time) / 2)
+                    time.sleep(sleep_time)
             except Exception as e:
                 print(f"❌ Handshake thread error: {e}")
-                time.sleep(0.1)
+                time.sleep(0.01)  # 出错时短暂休眠
     
     def adjust_quality_smart(self):
         """Smart quality adjustment"""
@@ -776,6 +854,8 @@ class WebPSender:
             self.handshake_thread = threading.Thread(target=self.handshake_thread_func)
             self.handshake_thread.daemon = True
             self.handshake_thread.start()
+            print(f"🤝 Handshake thread started - sending at {1000/self.handshake_interval:.1f}Hz")
+            print(f"🔄 Hybrid mode: Video over wireless + UART handshaking")
         
         print("🚀 WebP sender started successfully")
         print("📊 Performance mode: " + self.mode_description)
